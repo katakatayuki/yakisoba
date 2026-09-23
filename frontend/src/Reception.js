@@ -15,7 +15,7 @@ import {
 // サーバー / LINE QRコード設定
 // ====================================================================
 const SERVER_URL = 'https://hinodefes.onrender.com';
-const LINE_QR_CODE_URL = 'https://hinodefes-57609.web.app/QRCODE.png';
+const LINE_QR_CODE_URL = 'https://hinodefes-57609.web.app/QQRCODE.png';
 
 // ====================================================================
 // Firebase設定
@@ -112,6 +112,7 @@ export default function Reception() {
   const [reservations, setReservations] = useState([]);
 
   const [isReserved, setIsReserved] = useState(false);
+  const [reservationCode, setReservationCode] = useState(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
@@ -273,6 +274,7 @@ export default function Reception() {
   // ----------------------------------------------------------------
   const handleNewReservation = () => {
     setIsReserved(false);
+    setReservationCode(null);
     setName('');
     setPeople(1);
     setWantsLine(false);
@@ -356,7 +358,7 @@ export default function Reception() {
       // 予約IDと時間帯を通知APIへ渡す。API未対応でも予約自体は成功扱いにする。
       if (wantsLine) {
         try {
-          await fetch(`${SERVER_URL}/api/reservations/${reservationRef.id}/line`, {
+          const lineResponse = await fetch(`${SERVER_URL}/api/reservations/${reservationRef.id}/line`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -369,6 +371,13 @@ export default function Reception() {
               notifyBeforeMinutes: Number(settings.notifyBeforeMinutes),
             }),
           });
+
+          if (lineResponse.ok) {
+            const lineData = await lineResponse.json();
+            setReservationCode(lineData.reservationCode || null);
+          } else {
+            console.warn('LINE連携APIがエラーを返しました:', lineResponse.status);
+          }
         } catch (lineError) {
           // LINE連携APIがまだ新仕様に対応していない場合でも予約は保持する
           console.warn('LINE連携API呼び出しに失敗しました:', lineError);
@@ -442,15 +451,25 @@ export default function Reception() {
             <div style={styles.lineBox}>
               <h2 style={{ marginTop: 0 }}>LINE通知をご希望のお客様へ</h2>
               <p>
-                下のQRコードからLINEを友だち追加してください。
+                下のQRコードからLINEを友だち追加のうえ、
                 <br />
-                ご予約時間が近づくとLINEでもお知らせします。
+                トーク画面で下の「予約コード」を送信してください。
               </p>
               <img
                 src={LINE_QR_CODE_URL}
                 alt="LINE QR Code"
                 style={styles.qrCode}
               />
+              {reservationCode ? (
+                <div style={styles.reservationCodeBox}>
+                  <div style={styles.reservationCodeLabel}>予約コード</div>
+                  <div style={styles.reservationCodeValue}>{reservationCode}</div>
+                </div>
+              ) : (
+                <p style={{ fontSize: '0.85rem', color: '#9a3412', marginTop: '0.8rem' }}>
+                  予約コードの発行に失敗しました。受付スタッフにお声がけください。
+                </p>
+              )}
             </div>
           ) : (
             <div style={styles.infoBox}>
@@ -956,5 +975,24 @@ const styles = {
     height: '180px',
     marginTop: '0.7rem',
     objectFit: 'contain',
+  },
+  reservationCodeBox: {
+    marginTop: '1rem',
+    padding: '0.8rem',
+    backgroundColor: '#fff',
+    border: '2px dashed #f59e0b',
+    borderRadius: '8px',
+    display: 'inline-block',
+  },
+  reservationCodeLabel: {
+    fontSize: '0.8rem',
+    color: '#92400e',
+    fontWeight: '700',
+  },
+  reservationCodeValue: {
+    fontSize: '2.2rem',
+    fontWeight: '900',
+    letterSpacing: '0.3rem',
+    color: '#92400e',
   },
 };

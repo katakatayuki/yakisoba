@@ -1032,7 +1032,6 @@ export default function Admin() {
                   <button
                     type="button"
                     key={`${slot.start}-${slot.end}`}
-                    disabled={isFull}
                     onClick={() => setSelectedSlot(slot)}
                     style={{
                       ...styles.slot,

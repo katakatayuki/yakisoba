@@ -6,11 +6,10 @@ const fetch = require('node-fetch');
 const app = express();
 
 // ==========================================================
-// サーバー定
+// サーバー設定
 // ==========================================================
-// CORSを詳細に設定
 app.use(cors({
-    origin: '*',  // すべてのドメインからのアクセスを許可
+    origin: '*',
     methods: ['GET', 'POST', 'DELETE', 'PUT']
 }));
 
@@ -18,7 +17,6 @@ app.use(express.json());
 
 // Firebaseの初期化
 try {
-    // 環境変数からサービスアカウント情報をロード（Renderなどの環境を想定）
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
     admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
@@ -29,17 +27,41 @@ try {
 }
 
 const db = admin.firestore();
-const COUNTER_DOC = 'settings/counters';
 
 // ==========================================================
-// LINE Push/Reply Utility (エラーログ強化版)
+// 日時ユーティリティ（すべて日本時間 = JST基準で扱う）
+// ==========================================================
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+const pad2 = (n) => String(n).padStart(2, '0');
+
+// サーバーがどのタイムゾーンで動いていても、JSTの「壁時計時刻」を取得する
+function nowJST() {
+    return new Date(Date.now() + JST_OFFSET_MS);
+}
+
+function getTodayStringJST() {
+    const d = nowJST();
+    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+// 現在時刻を「その日の何分目か」に変換（0:00を0分とする）
+function getNowMinutesJST() {
+    const d = nowJST();
+    return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+
+// "HH:MM" 形式の文字列を分に変換
+function timeToMinutes(time) {
+    if (!time || !/^\d{2}:\d{2}$/.test(time)) return null;
+    const [h, m] = time.split(':').map(Number);
+    if (h < 0 || h > 23 || m < 0 || m > 59) return null;
+    return h * 60 + m;
+}
+
+// ==========================================================
+// LINE Push/Reply ユーティリティ
 // ==========================================================
 
-/**
- * 指定したユーザーIDへLINEのプッシュメッセージを送信する
- * @param {string} toUserId - LINEユーザーID
- * @param {string} messageText - 送信するテキストメッセージ
- */
 async function sendLinePush(toUserId, messageText) {
     if (!process.env.LINE_ACCESS_TOKEN) {
         console.error("LINE_ACCESS_TOKEN is not set.");
@@ -62,11 +84,6 @@ async function sendLinePush(toUserId, messageText) {
     }
 }
 
-/**
- * 受信したイベントへのLINEの応答メッセージを送信する
- * @param {string} replyToken - 応答トークン
- * @param {string} messageText - 送信するテキストメッセージ
- */
 async function sendLineReply(replyToken, messageText) {
     if (!process.env.LINE_ACCESS_TOKEN) return;
 
@@ -88,521 +105,334 @@ async function sendLineReply(replyToken, messageText) {
 }
 
 // ==========================================================
-// LINE Webhookイベントを非同期で処理する関数
+// 予約コードの発行
+// 予約1件ごとに4桁のコードを発行し、当日分で重複しないようにする
+// （団体・連番制は廃止。時間割制のもとでは予約1件＝1コードで十分）
 // ==========================================================
-async function processLineWebhookEvents(events, db) {
-    // Firebase Adminを関数内で使うために再取得
-    const admin = require('firebase-admin');
+async function generateUniqueReservationCode(reservationDate) {
+    for (let attempt = 0; attempt < 20; attempt++) {
+        const code = String(Math.floor(1000 + Math.random() * 9000)); // 1000〜9999
+
+        const existing = await db.collection('reservations')
+            .where('reservationDate', '==', reservationDate)
+            .where('reservationCode', '==', code)
+            .limit(1)
+            .get();
+
+        if (existing.empty) return code;
+    }
+    // 20回試しても衝突する場合はタイムスタンプ由来のコードにフォールバック
+    return String(Date.now()).slice(-4);
+}
+
+// ==========================================================
+// LINE Webhookイベント処理
+// ==========================================================
+async function processLineWebhookEvents(events) {
+    const today = getTodayStringJST();
 
     for (const event of events) {
-        // LINEユーザーIDと応答トークンを取得
-        const lineUserId = event.source.userId;
+        const lineUserId = event.source?.userId;
         const replyToken = event.replyToken;
-        const inputText = (event.type === 'message' && event.message.type === 'text') ? event.message.text.trim() : null;
+        const inputText = (event.type === 'message' && event.message.type === 'text')
+            ? event.message.text.trim()
+            : null;
 
         // -----------------------------------------------------
-        // 1. 友だち追加時 (follow)
+        // 1. 友だち追加時
         // -----------------------------------------------------
         if (event.type === 'follow') {
-            const message = '友だち追加ありがとうございます！\n準備完了の通知をご希望の場合は、お手持ちの「受付番号」をメッセージで送信してください。例: 1';
+            const message = 'このたびは友だち追加いただき、誠にありがとうございます！\n\nご予約時間が近づいたら、こちらのLINEでお知らせいたします。\n\n通知を受け取るには、予約完了画面に表示された「予約コード（4桁）」をこのトークに送信してください。\n例: 3821';
             await sendLineReply(replyToken, message);
+            continue;
         }
 
+        if (event.type !== 'message' || event.message.type !== 'text') continue;
+
         // -----------------------------------------------------
-        // 2. 「はい」のメッセージ受信時 (変更承認)
+        // 2. 「はい」= 別アカウントへの紐づけ変更を承認
         // -----------------------------------------------------
-        else if (event.type === 'message' && inputText === 'はい') {
+        if (inputText === 'はい') {
             const pendingSnap = await db.collection('reservations')
                 .where('pendingLineUserId', '==', lineUserId)
-                .where('status', '==', 'waiting')
                 .limit(1)
                 .get();
 
             if (pendingSnap.empty) {
-                await sendLineReply(replyToken, '申し訳ありません、変更を保留中の番号が見つかりませんでした。再度番号を送信してください。');
+                await sendLineReply(replyToken, '変更を保留中の予約コードが見つかりませんでした。もう一度、予約コードを送信してください。');
                 continue;
             }
 
             const docRef = pendingSnap.docs[0].ref;
-            // 番号は連番のみを想定 (例: 1, 2, 3...)
-            const reservationNumber = pendingSnap.docs[0].data().number;
+            const data = pendingSnap.docs[0].data();
 
             await docRef.update({
                 lineUserId: lineUserId,
-                pendingLineUserId: admin.firestore.FieldValue.delete()
+                pendingLineUserId: admin.firestore.FieldValue.delete(),
+                reminderSentAt: null, // 紐づけ先が変わったので通知状態をリセット
             });
 
-            const successMessage = `番号 ${reservationNumber} の通知先を、このアカウントに変更しました！準備ができたら通知します。`;
-            await sendLineReply(replyToken, successMessage);
+            await sendLineReply(
+                replyToken,
+                `予約コード ${data.reservationCode}（${data.slotStart}〜${data.slotEnd}）の通知先を、このアカウントに変更しました。`
+            );
+            continue;
         }
 
         // -----------------------------------------------------
-        // 3. テキストメッセージ受信時 (番号入力による新規紐付け/変更確認)
+        // 3. 4桁の予約コード入力
         // -----------------------------------------------------
-        else if (event.type === 'message' && event.message.type === 'text') {
-
-            // 入力された値は連番のみを想定
-            const reservationNumber = parseInt(inputText, 10);
-
-            if (isNaN(reservationNumber) || reservationNumber <= 0) {
-                const message = '申し訳ありません、通知設定には「受付番号」が必要です。番号を半角数字で再入力してください。例: 1';
-                await sendLineReply(replyToken, message);
-                continue;
-            }
-
-            // 'number'は数値として保存されていることを前提とする
-            const reservationSnap = await db.collection('reservations')
-                .where('number', '==', reservationNumber)
-                .where('status', 'in', ['waiting', 'called'])
-                .where('wantsLine', '==', true)
-                .limit(1)
-                .get();
-
-            if (reservationSnap.empty) {
-                const message = `番号 ${reservationNumber} の「待機中」または「呼び出し中」の予約は見つかりませんでした。番号を確認してください。`;
-                await sendLineReply(replyToken, message);
-                continue;
-            }
-
-            const doc = reservationSnap.docs[0];
-            const docData = doc.data();
-            const docRef = doc.ref;
-
-            // 既にLINE IDが紐付いているかチェック
-            if (docData.lineUserId) {
-                if (docData.lineUserId === lineUserId) {
-                    const message = `番号 ${reservationNumber} は既にあなたのLINEに紐付け済みです。準備ができたら通知します！`;
-                    await sendLineReply(replyToken, message);
-                } else {
-                    const message = `番号 ${reservationNumber} は、既に別のLINEアカウントに紐付けされています。\n\n**この番号の通知先を、このアカウントに変更しますか？**\n\n変更する場合は【はい】と返信してください。`;
-                    await sendLineReply(replyToken, message);
-                    // 変更を保留中の状態として保存
-                    await docRef.update({
-                        pendingLineUserId: lineUserId
-                    });
-                }
-                continue;
-            }
-
-            // 新規紐付けの実行
-            await docRef.update({ lineUserId: lineUserId });
-
-            const successMessage = `番号 ${reservationNumber} をあなたのLINEに紐付けました。準備ができたら通知します！`;
-            await sendLineReply(replyToken, successMessage);
-            console.log(`Successfully linked LINE ID ${lineUserId} to number ${reservationNumber}.`);
+        if (!/^\d{4}$/.test(inputText)) {
+            await sendLineReply(
+                replyToken,
+                '予約完了画面に表示されている「予約コード（4桁の数字）」を送信してください。\n例: 3821'
+            );
+            continue;
         }
+
+        const reservationSnap = await db.collection('reservations')
+            .where('reservationDate', '==', today)
+            .where('reservationCode', '==', inputText)
+            .limit(1)
+            .get();
+
+        if (reservationSnap.empty) {
+            await sendLineReply(
+                replyToken,
+                `予約コード ${inputText} が見つかりませんでした。本日分の予約コードか、入力に誤りがないかご確認ください。`
+            );
+            continue;
+        }
+
+        const doc = reservationSnap.docs[0];
+        const data = doc.data();
+        const docRef = doc.ref;
+
+        if (data.status === 'used') {
+            await sendLineReply(replyToken, `予約コード ${inputText} はすでに利用済みです。`);
+            continue;
+        }
+
+        if (data.lineUserId) {
+            if (data.lineUserId === lineUserId) {
+                await sendLineReply(
+                    replyToken,
+                    `予約コード ${inputText}（${data.slotStart}〜${data.slotEnd}）は、すでにこのアカウントに連携済みです。`
+                );
+            } else {
+                await sendLineReply(
+                    replyToken,
+                    `予約コード ${inputText}（${data.slotStart}〜${data.slotEnd}）は、既に別のLINEアカウントに連携されています。\n\nこのアカウントに変更しますか？\n変更する場合は【はい】と返信してください。`
+                );
+                await docRef.update({ pendingLineUserId: lineUserId });
+            }
+            continue;
+        }
+
+        // 新規紐づけ
+        await docRef.update({ lineUserId: lineUserId });
+
+        await sendLineReply(
+            replyToken,
+            `連携しました！\n\nご予約時間：${data.slotStart}〜${data.slotEnd}\nお名前：${data.name}様\n\nお時間の${data.notifyBeforeMinutes ?? 10}分前にこちらのLINEでお知らせします。`
+        );
     }
 }
 
 // ==========================================================
-// POST /api/reservations (予約登録) - 販売実績(salesStats)の更新処理を追加
-// ==========================================================
-app.post('/api/reservations', async (req, res) => {
-    try {
-        // 🚨 修正/追加: Reception.jsから送られてくる'items'を取得
-        const { group, name, people, wantsLine, lineUserId, items } = req.body;
-
-        if (!group || !name || !people) {
-            return res.status(400).send("Missing required fields: group, name, or people.");
-        }
-
-        // peopleを数値型に変換
-        const numPeople = parseInt(people, 10);
-        if (isNaN(numPeople) || numPeople <= 0) {
-            return res.status(400).send("People must be a valid positive number.");
-        }
-
-        // トランザクション処理 (番号の採番、予約保存、販売実績の更新を同時に行う)
-        const newNumber = await db.runTransaction(async (t) => {
-            const counterRef = db.doc(COUNTER_DOC);
-            const counterDoc = await t.get(counterRef);
-
-            let currentNumber = 1;
-            const currentCounters = counterDoc.exists ? counterDoc.data() : {};
-
-            // 団体ごとの連番管理ロジック
-            if (currentCounters[group]) {
-                const lastUpdated = currentCounters[group].updatedAt.toDate();
-                const now = new Date();
-                const TWELVE_HOURS_MS = 12 * 60 * 60 * 1000;
-
-                // 12時間経過していたらリセット
-                if (now.getTime() - lastUpdated.getTime() > TWELVE_HOURS_MS) {
-                    currentNumber = 1;
-                } else {
-                    currentNumber = currentCounters[group].currentNumber + 1; // インクリメント
-                }
-            }
-            
-            // 🚨 追加: salesStatsをアトミックに更新する処理
-            // --------------------------------------------------
-            if (items && Object.keys(items).length > 0) {
-                const salesStatsRef = db.doc('settings/salesStats');
-                const increments = {};
-                for (const [key, value] of Object.entries(items)) {
-                    if (value > 0) {
-                        // FieldValue.increment() を使ってアトミックに加算
-                        increments[key] = admin.firestore.FieldValue.increment(Number(value));
-                    }
-                }
-                // salesStatsドキュメントをトランザクション内で更新
-                if (Object.keys(increments).length > 0) {
-                    t.update(salesStatsRef, increments);
-                }
-            }
-            // --------------------------------------------------
-
-            // カウンターを更新
-            t.update(counterRef, {
-                [group]: {
-                    currentNumber: currentNumber,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                }
-            });
-
-            // 予約を登録
-            const newReservationRef = db.collection('reservations').doc();
-            t.set(newReservationRef, {
-                number: currentNumber, // 連番
-                group: group,
-                name: name,
-                people: numPeople,
-                wantsLine: !!wantsLine,
-                lineUserId: lineUserId || null,
-                status: 'waiting', // 常に待機中
-                createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                calledAt: null,
-                seatEnterAt: null,
-                // 🚨 修正: Reception.jsに合わせて'items'を保存
-                items: items || {},
-            });
-
-            return currentNumber;
-        });
-
-        // 応答を返す
-        res.json({ success: true, number: newNumber, group: group });
-
-    } catch (e) {
-        console.error("Error creating reservation:", e);
-        res.status(500).json({ error: "Failed to create reservation" });
-    }
-});
-
-
-// ==========================================================
-// POST /api/line-webhook: LINEからのイベント処理 (即時応答を確保)
+// POST /api/line-webhook
 // ==========================================================
 app.post('/api/line-webhook', async (req, res) => {
-
-    if (!process.env.LINE_SECRET || !process.env.LINE_ACCESS_TOKEN) {
-        console.error("LINE env variables are missing.");
+    if (!process.env.LINE_ACCESS_TOKEN) {
+        console.error("LINE_ACCESS_TOKEN is missing.");
         return res.sendStatus(500);
     }
 
-    // 🚨 最重要: LINEの応答期限(3秒)を遵守するため、即座に200 OKを返す
+    // LINEの応答期限（3秒）を守るため、先に200を返す
     res.sendStatus(200);
 
-    // イベント処理はres.sendStatus(200)の後に非同期で開始する
     try {
         const events = req.body.events;
         if (events && events.length > 0) {
-            // 非同期で実行し、応答速度を確保
-            processLineWebhookEvents(events, db).catch(e => {
-                console.error("Error initiating LINE event processing:", e);
+            processLineWebhookEvents(events).catch((e) => {
+                console.error("Error processing LINE webhook events:", e);
             });
         }
     } catch (e) {
-        // req.bodyのパース失敗など、リクエスト受信時のエラー
-        console.error("Error processing LINE webhook request body:", e);
+        console.error("Error reading LINE webhook body:", e);
     }
 });
 
-
 // ==========================================================
-// POST /api/compute-call (呼び出し計算とTV表示更新)
+// POST /api/reservations/:id/line
+// Reception.js から「LINEで通知を受け取る」を選択して予約した直後に呼ばれる。
+// 予約コードを発行し、通知のための情報をFirestoreに保存する。
 // ==========================================================
-app.post('/api/compute-call', async (req, res) => {
+app.post('/api/reservations/:id/line', async (req, res) => {
     try {
-        if (req.body.apiSecret !== process.env.API_SECRET) return res.status(403).send('forbidden');
+        const { id } = req.params;
+        const { reservationDate, slotStart, slotEnd, name, people, notifyBeforeMinutes } = req.body;
 
-        const availablePeople = parseInt(req.body.availableCount, 10);
-        const callGroup = req.body.callGroup;
+        const reservationRef = db.collection('reservations').doc(id);
+        const snap = await reservationRef.get();
 
-        if (isNaN(availablePeople) || availablePeople <= 0) {
-            return res.status(400).send('bad available (must be a valid positive number)');
-        }
-        // 団体名は5-5, 5-2など、カウンターで使われるキーを想定
-        if (!callGroup) {
-            return res.status(400).send('bad callGroup (must be specified)');
+        if (!snap.exists) {
+            return res.status(404).json({ error: 'Reservation not found' });
         }
 
-        let waitingQuery = db.collection('reservations')
-            .where('status', '==', 'waiting')
-            .where('group', '==', callGroup)
-            .orderBy('createdAt', 'asc');
+        const effectiveDate = reservationDate || snap.data().reservationDate || getTodayStringJST();
+        const reservationCode = await generateUniqueReservationCode(effectiveDate);
 
-        const waitingSnap = await waitingQuery.get();
-
-        let totalNeeded = 0;
-        const selected = [];
-
-        waitingSnap.forEach(doc => {
-            if (totalNeeded >= availablePeople) return;
-            const d = doc.data();
-            const need = d.people || 1;
-            if (totalNeeded + need <= availablePeople) {
-                totalNeeded += need;
-                selected.push({ id: doc.id, data: d });
-            }
+        await reservationRef.update({
+            wantsLine: true,
+            reservationCode,
+            notifyBeforeMinutes: Number.isFinite(Number(notifyBeforeMinutes))
+                ? Number(notifyBeforeMinutes)
+                : 10,
+            reminderSentAt: null,
+            // 念のためslot情報も同期しておく（Reception.js側の値を正とする）
+            ...(slotStart ? { slotStart } : {}),
+            ...(slotEnd ? { slotEnd } : {}),
+            ...(name ? { name } : {}),
+            ...(people ? { people: Number(people) } : {}),
         });
 
-        if (selected.length === 0) {
-            return res.json({ success: true, called: [], totalNeeded: 0 });
-        }
-
-        const batch = db.batch();
-        const now = admin.firestore.FieldValue.serverTimestamp();
-        const calledNumbers = [];
-        const tvRef = db.doc('tv/state');
-
-        const tvSnap = await tvRef.get();
-        const currentCalled = tvSnap.exists && tvSnap.data().currentCalled
-            ? tvSnap.data().currentCalled
-            : [];
-
-        selected.forEach(item => {
-            // numberは連番(数値)として保存されている
-            const reservationNumber = item.data.number !== undefined ? item.data.number : 9999;
-            const rRef = db.collection('reservations').doc(item.id);
-
-            batch.update(rRef, {
-                status: 'called',
-                calledAt: now,
-                // numberフィールドは更新しないが、ログのために取得
-            });
-
-            calledNumbers.push(reservationNumber);
-
-            if (item.data.wantsLine && item.data.lineUserId) {
-                // LINE通知では、連番のみを通知
-                const text = `ご準備ができました。番号 ${reservationNumber} さん、受付へお戻りください。`;
-                sendLinePush(item.data.lineUserId, text).catch(e => console.error(e));
-            }
-        });
-
-        // 1. 既存のリストと新しく呼び出す番号を結合し、重複を排除
-        // numberは数値だが、TV表示ロジックは文字列を扱う可能性があるため、念のため文字列に変換する
-        const newCalledSet = new Set([...currentCalled.map(n => String(n)), ...calledNumbers.map(n => String(n))]);
-        let updatedCalledList = Array.from(newCalledSet).map(n => parseInt(n, 10));
-
-        // 2. Firestoreのinクエリの制限（最大10個）を回避するため、リストを最大10個に制限する
-        // 最新の10個のみを保持するために、配列の末尾10要素をスライスします。
-        if (updatedCalledList.length > 10) {
-            updatedCalledList = updatedCalledList.slice(-10);
-        }
-
-        // 3. TV表示用のドキュメントを更新
-        batch.set(tvRef, {
-            currentCalled: updatedCalledList,
-            updatedAt: now
-        }, { merge: true });
-
-        // 4. トランザクションをコミット
-        await batch.commit();
-
-        await db.collection('logs').add({
-            type: 'call',
-            reservationIds: selected.map(s => s.id),
-            available: availablePeople,
-            callGroup: callGroup,
-            calledNumbers: calledNumbers,
-            createdAt: now
-        });
-
-        res.json({ success: true, called: calledNumbers, totalNeeded });
-
+        res.json({ success: true, reservationCode });
     } catch (e) {
-        console.error("CRITICAL ERROR IN COMPUTE-CALL:", e);
-        return res.status(500).send("Internal Server Error. Check Render logs for details.");
+        console.error('Error issuing reservation code:', e);
+        res.status(500).json({ error: 'Failed to issue reservation code' });
     }
 });
 
+// ==========================================================
+// PUT /api/reservations/:id/status/entryGuidance
+// Admin.js の「📢 入場案内」ボタンから呼ばれる。
+// ステータス変更自体はAdmin.js側でFirestoreに直接反映されるため、
+// ここではLINE連携済みなら「今すぐ受付にお越しください」を即時プッシュする。
+// ==========================================================
+app.put('/api/reservations/:id/status/entryGuidance', async (req, res) => {
+    try {
+        if (req.body.apiSecret !== process.env.API_SECRET) {
+            return res.status(403).send('forbidden');
+        }
+
+        const { id } = req.params;
+        const snap = await db.collection('reservations').doc(id).get();
+
+        if (!snap.exists) {
+            return res.status(404).json({ error: 'Reservation not found' });
+        }
+
+        const data = snap.data();
+
+        if (data.wantsLine && data.lineUserId) {
+            const text = `ご準備ができました！\n${data.name}様（${data.slotStart}〜${data.slotEnd}）\n受付までお越しください。`;
+            sendLinePush(data.lineUserId, text).catch((e) => console.error('entryGuidance push failed:', e));
+        }
+
+        res.json({ success: true, id });
+    } catch (e) {
+        console.error(`Error in entryGuidance notification for ${req.params.id}:`, e);
+        res.status(500).send('Notification failed.');
+    }
+});
 
 // ==========================================================
-// GET /api/waiting-summary
+// 事前リマインド送信（時間割ベースの自動チェック）
+// 「予約時間 − 何分前に通知するか」を過ぎたら、まだ送っていない
+// LINE連携済み予約に対してプッシュ通知を送る。
 // ==========================================================
-app.get('/api/waiting-summary', async (req, res) => {
+async function checkAndSendReminders() {
     try {
-        const waitingSnap = await db.collection('reservations')
-            .where('status', '==', 'waiting')
+        const today = getTodayStringJST();
+        const nowMinutes = getNowMinutesJST();
+
+        const snap = await db.collection('reservations')
+            .where('reservationDate', '==', today)
+            .where('wantsLine', '==', true)
             .get();
 
-        // 団体キーは動的に変わる可能性を考慮し、セットで管理する
-        const groups = new Set();
-        waitingSnap.forEach(doc => groups.add(doc.data().group));
+        const tasks = [];
 
-        const summary = {};
-        groups.forEach(group => {
-            summary[group] = { groups: 0, people: 0 };
-        });
+        snap.forEach((docSnap) => {
+            const data = docSnap.data();
 
-        waitingSnap.forEach(doc => {
-            const data = doc.data();
-            const groupKey = data.group;
-            const people = data.people || 1;
+            if (data.status !== 'reserved') return; // 入場案内済み・利用済みは対象外
+            if (!data.lineUserId) return; // LINE未連携
+            if (data.reminderSentAt) return; // 送信済み
+            if (!data.slotStart) return;
 
-            if (summary.hasOwnProperty(groupKey)) {
-                summary[groupKey].groups += 1;
-                summary[groupKey].people += people;
+            const slotMinutes = timeToMinutes(data.slotStart);
+            if (slotMinutes === null) return;
+
+            const notifyBefore = Number.isFinite(Number(data.notifyBeforeMinutes))
+                ? Number(data.notifyBeforeMinutes)
+                : 10;
+            const targetMinutes = slotMinutes - notifyBefore;
+
+            if (nowMinutes >= targetMinutes) {
+                const text = `まもなくご予約のお時間です。\n\nご予約時間：${data.slotStart}〜${data.slotEnd}\nお名前：${data.name}様\n\n受付までお越しください。`;
+
+                tasks.push(
+                    sendLinePush(data.lineUserId, text)
+                        .then(() => docSnap.ref.update({
+                            reminderSentAt: admin.firestore.FieldValue.serverTimestamp(),
+                        }))
+                        .catch((e) => console.error(`Reminder push failed for ${docSnap.id}:`, e))
+                );
             }
         });
 
-        res.json(summary);
-
+        await Promise.all(tasks);
     } catch (e) {
-        console.error("Error fetching waiting summary:", e);
-        res.status(500).json({ error: "Failed to fetch summary" });
+        console.error('checkAndSendReminders failed:', e);
     }
-});
+}
 
-
-// ==========================================================
-// GET /api/tv-status
-// ==========================================================
-app.get('/api/tv-status', async (req, res) => {
-    try {
-        const doc = await db.doc('tv/state').get();
-        if (!doc.exists) {
-            return res.json({ currentCalled: [], updatedAt: null });
-        }
-
-        const data = doc.data();
-        const now = new Date();
-
-        if (!data.currentCalled || data.currentCalled.length === 0) {
-            return res.json({ currentCalled: [], updatedAt: data.updatedAt });
-        }
-
-        // currentCalledは連番(数値)の配列として保存されている前提
-
-        // Firestoreのin句制限を回避するため、クエリに渡すリストを最大10個にスライス
-        let numbersToQuery = data.currentCalled;
-        if (numbersToQuery.length > 10) {
-            numbersToQuery = numbersToQuery.slice(-10);
-        }
-
-        // numbersToQueryを使用
-        const calledReservationSnap = await db.collection('reservations')
-            .where('status', 'in', ['called', 'seatEnter'])
-            .where('number', 'in', numbersToQuery) // numberは数値
-            .get();
-
-        const stillCalledNumbers = [];
-        const TEN_MINUTES_MS = 10 * 60 * 1000;
-
-        calledReservationSnap.forEach(rDoc => {
-            const rData = rDoc.data();
-            if (!rData.calledAt) return;
-
-            const calledAt = rData.calledAt.toDate();
-
-            // 呼び出し時刻から10分以内なら表示を継続
-            if (now.getTime() - calledAt.getTime() < TEN_MINUTES_MS) {
-                stillCalledNumbers.push(rData.number);
-            }
-        });
-
-        res.json({ currentCalled: stillCalledNumbers, updatedAt: data.updatedAt });
-
-    } catch (e) {
-        console.error("Error fetching tv status:", e);
-        res.status(500).json({ error: "Failed to fetch status" });
-    }
-});
+const REMINDER_CHECK_INTERVAL_MS = 60 * 1000; // 1分ごとにチェック
+setInterval(checkAndSendReminders, REMINDER_CHECK_INTERVAL_MS);
+checkAndSendReminders(); // 起動直後にも一度実行
 
 // ==========================================================
-// GET /api/reservations (管理画面用ルート)
+// GET /api/reservations（管理用・任意）
 // ==========================================================
 app.get('/api/reservations', async (req, res) => {
     try {
         const snap = await db.collection('reservations')
             .orderBy('createdAt', 'desc')
-            .limit(100)
+            .limit(200)
             .get();
 
-        const reservations = snap.docs.map(doc => ({
+        const reservations = snap.docs.map((doc) => ({
             id: doc.id,
-            ...doc.data()
+            ...doc.data(),
         }));
 
         res.json(reservations);
     } catch (e) {
-        console.error("Error fetching reservations:", e);
-        res.status(500).json({ error: "Failed to fetch reservations" });
+        console.error('Error fetching reservations:', e);
+        res.status(500).json({ error: 'Failed to fetch reservations' });
     }
 });
 
 // ==========================================================
-// PUT /api/reservations/:id (管理画面からのステータス更新)
-// ==========================================================
-app.put('/api/reservations/:id', async (req, res) => {
-    try {
-        if (req.body.apiSecret !== process.env.API_SECRET) return res.status(403).send('forbidden');
-
-        const { id } = req.params;
-        const { status } = req.body;
-
-        const validStatuses = ['waiting', 'called', 'seatEnter', 'cancel'];
-        if (!validStatuses.includes(status)) {
-            return res.status(400).send('Invalid status value.');
-        }
-
-        const reservationRef = db.collection('reservations').doc(id);
-
-        const updateData = { status };
-
-        if (status === 'called') {
-            updateData.calledAt = admin.firestore.FieldValue.serverTimestamp();
-            updateData.seatEnterAt = null;
-        } else if (status === 'seatEnter') {
-            updateData.seatEnterAt = admin.firestore.FieldValue.serverTimestamp();
-        } else if (status === 'waiting' || status === 'cancel') {
-            updateData.calledAt = null;
-            updateData.seatEnterAt = null;
-        }
-
-        await reservationRef.update(updateData);
-
-        res.json({ success: true, id, newStatus: status });
-
-    } catch (e) {
-        console.error(`Error updating reservation ${req.params.id}:`, e);
-        res.status(500).send("Status update failed.");
-    }
-});
-
-// ==========================================================
-// DELETE /api/reservations/:id (管理画面らの削除)
+// DELETE /api/reservations/:id（管理用・任意）
 // ==========================================================
 app.delete('/api/reservations/:id', async (req, res) => {
     try {
-        if (req.body.apiSecret !== process.env.API_SECRET) return res.status(403).send('forbidden');
+        if (req.body.apiSecret !== process.env.API_SECRET) {
+            return res.status(403).send('forbidden');
+        }
 
         const { id } = req.params;
-
-        const reservationRef = db.collection('reservations').doc(id);
-
-        await reservationRef.delete();
+        await db.collection('reservations').doc(id).delete();
 
         res.json({ success: true, id });
-
     } catch (e) {
         console.error(`Error deleting reservation ${req.params.id}:`, e);
-        res.status(500).send("Reservation deletion failed.");
+        res.status(500).send('Reservation deletion failed.');
     }
 });
-
 
 // サーバーの待ち受け開始
 const PORT = process.env.PORT || 3000;
