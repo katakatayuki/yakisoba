@@ -1,552 +1,243 @@
+/* global __firebase_config, __initial_auth_token */
 import React, { useEffect, useState, useMemo } from 'react';
 
 // ====================================================================
 // Firebase/API インポート
 // ====================================================================
-import { initializeApp, getApps, getApp } from 'firebase/app';
-import { getAuth, signInAnonymously } from 'firebase/auth';
-import {
-  getFirestore,
-  collection,
-  query,
-  orderBy,
-  onSnapshot,
-  doc,
-} from 'firebase/firestore';
-import { setLogLevel } from 'firebase/firestore';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously } from 'firebase/auth';
+import { getFirestore, collection, query, onSnapshot, where, orderBy, doc } from "firebase/firestore"; // docを追加
+import { setLogLevel } from 'firebase/firestore'; // ログレベル設定
 
-// ====================================================================
-// Firebase 設定
-//
-// Admin.js / Reception.js と同じ Firestore 構造を参照しています。
-//   - settings/attraction ドキュメント（時間割の設定）
-//   - reservations コレクション（当日の予約一覧）
-// ====================================================================
-const firebaseConfig = process.env.REACT_APP_FIREBASE_CONFIG
-  ? JSON.parse(process.env.REACT_APP_FIREBASE_CONFIG)
-  : {};
+// グローバル変数から設定を取得 (no-undefエラー対策済み)
+//const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 
-const DEFAULT_SETTINGS = {
-  startTime: '10:00',
-  endTime: '18:00',
-  sessionDurationMinutes: 30,
-  maxPeoplePerSession: 10,
-  notifyBeforeMinutes: 10,
-};
+const firebaseConfig = process.env.REACT_APP_FIREBASE_CONFIG ? JSON.parse(process.env.REACT_APP_FIREBASE_CONFIG) : {};
 
-// ====================================================================
-// 共通ユーティリティ（Admin.js / Reception.js と同じロジック）
-// ====================================================================
-const pad2 = (n) => String(n).padStart(2, '0');
 
-const getTodayString = () => {
-  const now = new Date();
-  return `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`;
-};
+//const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-const timeToMinutes = (time) => {
-  if (!time || !/^\d{2}:\d{2}$/.test(time)) return null;
-  const [h, m] = time.split(':').map(Number);
-  if (h < 0 || h > 23 || m < 0 || m > 59) return null;
-  return h * 60 + m;
-};
+const initialAuthToken = null; // グローバル変数への依存を排除
 
-const minutesToTime = (minutes) => {
-  const h = Math.floor(minutes / 60) % 24;
-  const m = minutes % 60;
-  return `${pad2(h)}:${pad2(m)}`;
-};
-
-const makeSlots = (startTime, endTime, durationMinutes) => {
-  const start = timeToMinutes(startTime);
-  const end = timeToMinutes(endTime);
-  const duration = Number(durationMinutes);
-
-  if (
-    start === null ||
-    end === null ||
-    end <= start ||
-    !Number.isInteger(duration) ||
-    duration <= 0
-  ) {
-    return [];
-  }
-
-  const result = [];
-  for (let cursor = start; cursor + duration <= end; cursor += duration) {
-    result.push({
-      start: minutesToTime(cursor),
-      end: minutesToTime(cursor + duration),
-    });
-  }
-  return result;
-};
-
-const toDate = (value) => {
-  if (!value) return null;
-  if (value?.toDate) return value.toDate();
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date;
-};
-
-const getReservationDate = (reservation) => {
-  if (reservation.reservationDate) return reservation.reservationDate;
-  const date = toDate(reservation.createdAt);
-  if (!date) return null;
-  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
-};
-
-const getSlotStart = (reservation) =>
-  reservation.slotStart || reservation.startTime || null;
-
-// 旧データ（waiting/called/completed等）が残っていても表示できるようにする
-const normalizeStatus = (status) => {
-  if (status === 'waiting') return 'reserved';
-  if (status === 'called') return 'entryGuidance';
-  if (status === 'completed' || status === 'seatEnter') return 'used';
-  return status || 'reserved';
-};
-
-// ====================================================================
-// 混雑度に応じた色を決定する
-// 0〜4割: 空きあり（緑） / 5〜7割: やや混雑（黄） / 8〜9割: 混雑（赤） / 10割: 満席（灰）
-// ====================================================================
-const getCongestionLevel = (reservedPeople, maxPeople) => {
-  const capacity = Number(maxPeople) > 0 ? Number(maxPeople) : 0;
-  if (capacity <= 0) return 'full';
-
-  const ratio = reservedPeople / capacity;
-
-  if (ratio >= 1) return 'full'; // 10割
-  if (ratio >= 0.8) return 'busy'; // 8〜9割
-  if (ratio >= 0.5) return 'moderate'; // 5〜7割
-  return 'available'; // 0〜4割
-};
-
-const CONGESTION_STYLE = {
-  available: {
-    label: '空きあり',
-    background: '#2ecc71',
-    text: '#003d1a',
-  },
-  moderate: {
-    label: 'やや混雑',
-    background: '#f1c40f',
-    text: '#4d3b00',
-  },
-  busy: {
-    label: '混雑',
-    background: '#e74c3c',
-    text: '#ffffff',
-  },
-  full: {
-    label: '満席',
-    background: '#7f8c8d',
-    text: '#ffffff',
-  },
-};
+// 商品定義（焼きそば単品販売のため団体・グループの概念は廃止）
+const ITEM_KEY = 'yakisoba';
 
 export default function TVDisplay() {
+  // Firebaseの初期化状態とインスタンス
   const [db, setDb] = useState(null);
-  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
-  const [reservations, setReservations] = useState([]);
+  const [auth, setAuth] = useState(null);
+  
+  // 呼び出し中の番号の状態
+  const [calledNumbers, setCalledNumbers] = useState([]);
+  
+  // 待ち状況のサマリーの状態（件数と焼きそば数のみ）
+  const [waitingSummary, setWaitingSummary] = useState({ orders: 0, yakisoba: 0 });
+
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-
-  const today = useMemo(() => getTodayString(), []);
 
   // 1. Firebaseの初期化と認証
   useEffect(() => {
     if (!Object.keys(firebaseConfig).length) {
-      setError('Firebase設定が見つかりません。');
+      setError("Firebase設定が見つかりません。");
       setLoading(false);
-      return undefined;
+      return;
     }
 
     try {
-      const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+      const app = initializeApp(firebaseConfig);
       const firestore = getFirestore(app);
       const authentication = getAuth(app);
-      setLogLevel('error');
-      setDb(firestore);
+      
+      // デバッグログを有効にする（任意）
+      setLogLevel('debug'); 
 
-      if (!authentication.currentUser) {
-        signInAnonymously(authentication).catch((authError) => {
-          console.error('Firebase認証エラー:', authError);
-          setError('認証に失敗しました。');
+      const authenticate = async () => {
+        try {
+          if (initialAuthToken) {
+            await signInWithCustomToken(authentication, initialAuthToken);
+          } else {
+            // トークンがない場合は匿名認証で続行（表示専用のため）
+            await signInAnonymously(authentication);
+          }
+          setDb(firestore);
+          setAuth(authentication);
+          // 認証が完了しても、データ購読が完了するまでloadingをtrueに保つため、ここではfalseにしない
+        } catch (e) {
+          console.error("Firebase認証エラー:", e);
+          setError("認証に失敗しました。");
           setLoading(false);
-        });
-      }
+        }
+      };
+      
+      authenticate();
+
     } catch (e) {
-      console.error('Firebase初期化エラー:', e);
-      setError('Firebaseの初期化に失敗しました。');
+      console.error("Firebase初期化エラー:", e);
+      setError("Firebaseの初期化に失敗しました。");
       setLoading(false);
     }
-
-    return undefined;
   }, []);
 
-  // 2. 設定（時間割の基本情報）をリアルタイム取得
+  // 2. onSnapshotによるリアルタイム購読
   useEffect(() => {
-    if (!db) return undefined;
+    if (!db) return; // DBインスタンスが準備できていなければ何もしない
+    
+    // データ購読開始時にloadingを再セット（認証完了時にloadingを解除しなかったため、ここでは不要だが念のため）
+    if (!loading) setLoading(true); 
 
-    const unsubscribe = onSnapshot(
-      doc(db, 'settings', 'attraction'),
-      (snapshot) => {
-        setSettings(
-          snapshot.exists()
-            ? { ...DEFAULT_SETTINGS, ...snapshot.data() }
-            : DEFAULT_SETTINGS
-        );
-      },
-      (err) => {
-        console.error('設定取得エラー:', err);
-        setError('アトラクション設定の取得に失敗しました。');
-        setLoading(false);
-      }
-    );
-
-    return () => unsubscribe();
-  }, [db]);
-
-  // 3. 当日の予約をリアルタイム取得
-  useEffect(() => {
-    if (!db) return undefined;
-
+    // TV表示に必要な全ての予約データを取得するクエリ
+    // 🚨 注意: Firestoreは複合クエリ（where + orderBy）でインデックスを要求することがありますが、
+    // ここではwaiting/calledのデータ量が少ないことを想定し、シンプルに記述します。
+    // 実際のエラーが発生した場合は、orderByを削除し、クライアント側でソートします。
     const reservationsQuery = query(
-      collection(db, 'reservations'),
-      orderBy('createdAt', 'desc')
+        collection(db, "reservations"),
+        where('status', 'in', ['waiting', 'called']),
+        orderBy("number", "asc")
     );
 
-    const unsubscribe = onSnapshot(
-      reservationsQuery,
-      (snapshot) => {
-        const list = snapshot.docs.map((snapshotDoc) => ({
-          id: snapshotDoc.id,
-          ...snapshotDoc.data(),
-        }));
-        setReservations(list);
-        setLoading(false);
-      },
-      (err) => {
-        console.error('Firestoreリスニングエラー:', err);
-        setError('データ取得に失敗しました。');
-        setLoading(false);
-      }
-    );
+    // onSnapshotでリアルタイム購読を開始
+    const unsubscribe = onSnapshot(reservationsQuery, (snapshot) => {
+      let currentCalled = [];
+      let summary = { orders: 0, yakisoba: 0 };
 
-    return () => unsubscribe();
-  }, [db]);
-
-  // ----------------------------------------------------------------
-  // 時間割の自動生成と各時間帯の集計
-  // ----------------------------------------------------------------
-  const slots = useMemo(
-    () =>
-      makeSlots(
-        settings.startTime,
-        settings.endTime,
-        Number(settings.sessionDurationMinutes)
-      ),
-    [settings.startTime, settings.endTime, settings.sessionDurationMinutes]
-  );
-
-  const slotSummaries = useMemo(() => {
-    const maxPeople = Number(settings.maxPeoplePerSession);
-
-    return slots.map((slot) => {
-      const todaySlotReservations = reservations.filter((r) => {
-        return (
-          getReservationDate(r) === today && getSlotStart(r) === slot.start
-        );
+      snapshot.forEach((doc) => {
+        const data = doc.data();
+        
+        // 1. 呼び出し中の番号を収集
+        if (data.status === 'called') {
+          currentCalled.push({ number: data.number });
+        }
+        
+        // 2. 待ち状況のサマリーを計算（件数と焼きそば数）
+        if (data.status === 'waiting') {
+          summary.orders += 1;
+          summary.yakisoba += (data.quantity ?? data.items?.[ITEM_KEY] ?? 0);
+        }
       });
 
-      // 「利用済み」は定員計算から除外（Reception.js/Admin.jsと同じ扱い）
-      const activeReservations = todaySlotReservations.filter(
-        (r) => normalizeStatus(r.status) !== 'used'
-      );
-
-      const reservedPeople = activeReservations.reduce(
-        (sum, r) => sum + Math.max(0, Number(r.people) || 0),
-        0
-      );
-
-      const isCalled = todaySlotReservations.some(
-        (r) => normalizeStatus(r.status) === 'entryGuidance'
-      );
-
-      return {
-        ...slot,
-        reservedPeople,
-        remaining: Math.max(0, maxPeople - reservedPeople),
-        level: getCongestionLevel(reservedPeople, maxPeople),
-        isCalled,
-      };
+      setCalledNumbers(currentCalled.map(c => c.number));
+      setWaitingSummary(summary);
+      setLoading(false); // データ取得が完了したらloadingを解除
+      
+    }, (err) => {
+      // リスニング失敗時のエラーハンドリング
+      console.error("Firestoreリスニングエラー:", err);
+      setError("データ取得に失敗しました。");
+      setLoading(false);
     });
-  }, [slots, reservations, today, settings.maxPeoplePerSession]);
 
-  const calledSlots = useMemo(
-    () => slotSummaries.filter((slot) => slot.isCalled),
-    [slotSummaries]
-  );
+    // クリーンアップ関数
+    return () => unsubscribe();
+  }, [db]); // dbインスタンスがセットされたら実行
 
-  const calledSlotsText = useMemo(
-    () => calledSlots.map((slot) => `${slot.start}〜${slot.end}`).join(' / '),
-    [calledSlots]
-  );
+  // --------------------------------------------------------------------------------
+  // useMemo (フックのルールに従い、常にトップレベルで呼び出されます)
+  // --------------------------------------------------------------------------------
+  const getStatusMessage = useMemo(() => {
+    if (calledNumbers.length > 0) {
+      return `現在の呼び出し番号: ${calledNumbers.join(', ')}`;
+    }
+    if (waitingSummary.orders > 0) {
+        // 待っている注文が存在する場合
+        return `現在 ${waitingSummary.orders} 件（焼きそば ${waitingSummary.yakisoba} 食）調理中です。`;
+    }
+    return "受付は終了しました。";
+  }, [calledNumbers, waitingSummary]);
 
-  const totalWaitingGroups = useMemo(() => {
-    return reservations.filter(
-      (r) =>
-        getReservationDate(r) === today &&
-        normalizeStatus(r.status) === 'reserved'
-    ).length;
-  }, [reservations, today]);
 
-  if (loading || !db) {
-    return <div style={styles.messageScreen}>⚡️ リアルタイムデータを読み込み中...</div>;
-  }
-  if (error) {
-    return <div style={{ ...styles.messageScreen, color: 'red' }}>エラー: {error}</div>;
-  }
+  // --------------------------------------------------------------------------------
+  // UI (早期リターン)
+  // --------------------------------------------------------------------------------
+  
+  if (loading || !db) return <div style={{ textAlign: 'center', padding: '50px', fontSize: '30px', color: '#666' }}>⚡️ リアルタイムデータを読み込み中...</div>;
+  if (error) return <div style={{ textAlign: 'center', padding: '50px', fontSize: '30px', color: 'red' }}>エラー: {error}</div>;
+
 
   return (
-    <div style={styles.container}>
-      {/* グローバルスタイル */}
+    <div style={{ 
+      padding: '40px', 
+      minHeight: '100vh', 
+      backgroundColor: '#00264d', // 濃い青の背景
+      color: 'white', 
+      fontFamily: 'Inter, sans-serif',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      textAlign: 'center'
+    }}>
       <style>{`
-        body { margin: 0; font-family: 'Hiragino Sans', 'ヒラギノ角ゴシック', 'メイリオ', Meiryo, 'MS Pゴシック', sans-serif; }
-        * { box-sizing: border-box; }
         @keyframes pulse {
           0% { transform: scale(1); }
-          50% { transform: scale(1.02); }
+          50% { transform: scale(1.05); }
           100% { transform: scale(1); }
         }
       `}</style>
 
-      {/* 現在ご案内中（呼び出し中）の時間帯 */}
-      <div style={styles.calledSection}>
-        <h1 style={styles.calledTitle}>ただいまご案内中の時間帯</h1>
-        <div
-          style={{
-            ...styles.calledNumberWrapper,
-            animation: calledSlots.length > 0 ? 'pulse 1.5s infinite' : 'none',
-          }}
-        >
-          {calledSlots.length > 0 ? (
-            <span style={styles.calledNumberText}>{calledSlotsText}</span>
-          ) : (
-            <span style={{ ...styles.calledNumberText, fontSize: '7vh' }}>
-              {totalWaitingGroups > 0
-                ? `現在 ${totalWaitingGroups} 組予約待ち`
-                : '受付終了'}
-            </span>
-          )}
+      {/* 待ち状況エリア */}
+      <div style={{
+        backgroundColor: '#0055aa',
+        width: '90%',
+        borderRadius: '15px',
+        padding: '20px',
+        boxShadow: '0 8px 15px rgba(0, 0, 0, 0.3)',
+        marginBottom: '40px'
+      }}>
+        <h2 style={{ fontSize: '1.8em', marginBottom: '15px', borderBottom: '2px solid #3385ff', paddingBottom: '10px' }}>🍜 焼きそば 待ち状況</h2>
+        <div style={{ display: 'flex', justifyContent: 'center', marginTop: '15px', flexWrap: 'wrap', gap: '15px' }}>
+          <div style={{ 
+              padding: '10px 30px', 
+              backgroundColor: '#007bff',
+              borderRadius: '10px',
+              minWidth: '200px'
+          }}>
+            <h4 style={{ fontSize: '1.5em', margin: '0 0 5px 0' }}>調理待ち</h4>
+            <p style={{ fontSize: '1.1em', margin: '0' }}>件数: <strong>{waitingSummary.orders}</strong> 件 / 焼きそば: <strong>{waitingSummary.yakisoba}</strong> 食</p>
+          </div>
         </div>
-        <p style={styles.subText}>
-          お呼び出し後は、受付までお越しください。
-        </p>
       </div>
+      
+      {/* 呼び出し中の番号リスト */}
+      <div style={{ 
+        width: '90%',
+        backgroundColor: '#fff',
+        color: '#333',
+        borderRadius: '15px',
+        padding: '30px 20px',
+        boxShadow: '0 12px 25px rgba(0, 0, 0, 0.5)'
+      }}> 
+        <h1 style={{ fontSize: '2.5em', color: '#dc3545', margin: '0 0 20px 0' }}>現在呼び出し中の番号</h1>
 
-      {/* 時間割エリア */}
-      <div style={styles.scheduleSection}>
-        <div style={styles.scheduleHeader}>
-          <h2 style={styles.scheduleTitle}>本日の時間割・混雑状況</h2>
-          <div style={styles.legend}>
-            {Object.entries(CONGESTION_STYLE).map(([key, style]) => (
-              <div key={key} style={styles.legendItem}>
-                <span
-                  style={{
-                    ...styles.legendSwatch,
-                    backgroundColor: style.background,
-                  }}
-                />
-                <span>{style.label}</span>
+        {calledNumbers.length > 0 ? (
+          <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: '20px' }}>
+            {calledNumbers.map((n, index) => (
+              <div key={index} style={{
+                minWidth: '150px',
+                margin: '10px',
+                padding: '25px 35px',
+                border: '4px solid #dc3545',
+                borderRadius: '10px',
+                backgroundColor: '#ffe5e5',
+                color: '#dc3545',
+                fontSize: '3em', // 大きなフォント
+                fontWeight: '900',
+                animation: 'pulse 1.5s infinite', // アニメーション
+                boxShadow: '0 4px 10px rgba(220, 53, 69, 0.5)'
+              }}>
+                {n}
               </div>
             ))}
           </div>
-        </div>
-
-        {slotSummaries.length === 0 ? (
-          <div style={styles.emptySchedule}>本日の時間割はありません。</div>
         ) : (
-          <div style={styles.slotGrid}>
-            {slotSummaries.map((slot) => {
-              const style = CONGESTION_STYLE[slot.level];
-              return (
-                <div
-                  key={`${slot.start}-${slot.end}`}
-                  style={{
-                    ...styles.slotCard,
-                    backgroundColor: style.background,
-                    color: style.text,
-                    ...(slot.isCalled ? styles.slotCardCalled : {}),
-                  }}
-                >
-                  <div style={styles.slotTime}>
-                    {slot.start}
-                    <br />〜{slot.end}
-                  </div>
-                  <div style={styles.slotRemaining}>
-                    {slot.level === 'full' ? '満席' : `残り ${slot.remaining}人`}
-                  </div>
-                  {slot.isCalled && (
-                    <div style={styles.slotCalledBadge}>ご案内中</div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+          <p style={{ fontSize: '1.8em', color: '#555', padding: '50px 0' }}>
+            {getStatusMessage}
+          </p>
         )}
       </div>
+
+      <p style={{ marginTop: '30px', fontSize: '1.2em', opacity: 0.8 }}>
+        お呼び出し後、10分以内にお受け取りください。
+      </p>
     </div>
   );
 }
-
-// レスポンシブなスタイル定義
-const styles = {
-  container: {
-    width: '100vw',
-    height: '100vh',
-    backgroundColor: '#001f3f', // ネイビー
-    color: 'white',
-    display: 'flex',
-    flexDirection: 'column',
-  },
-  messageScreen: {
-    width: '100vw',
-    height: '100vh',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    fontSize: '5vh',
-    color: '#666',
-    backgroundColor: '#f0f0f0',
-  },
-  calledSection: {
-    flex: 3, // 画面の約半分〜3/5を占める
-    display: 'flex',
-    flexDirection: 'column',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: '2vh 2vw',
-    borderBottom: '0.5vh solid #0074D9',
-    textAlign: 'center',
-  },
-  calledTitle: {
-    fontSize: '6vh',
-    color: '#FF4136', // 赤
-    margin: '0 0 2vh 0',
-    fontWeight: '900',
-  },
-  calledNumberWrapper: {
-    backgroundColor: '#fff',
-    color: '#FF4136',
-    borderRadius: '2vh',
-    padding: '2vh 5vw',
-    margin: '1vh 0',
-    width: '90%',
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    minHeight: '20vh',
-  },
-  calledNumberText: {
-    fontSize: '10vh',
-    fontWeight: '900',
-    lineHeight: 1.2,
-    wordBreak: 'break-word',
-    textAlign: 'center',
-  },
-  subText: {
-    fontSize: '3vh',
-    opacity: 0.9,
-    marginTop: '1vh',
-  },
-  scheduleSection: {
-    flex: 4, // 画面の約半分〜3/5を占める
-    backgroundColor: '#001a33',
-    padding: '2vh 2vw',
-    width: '100%',
-    overflow: 'hidden',
-    display: 'flex',
-    flexDirection: 'column',
-  },
-  scheduleHeader: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: '1vh',
-    marginBottom: '1.5vh',
-  },
-  scheduleTitle: {
-    fontSize: '3.5vh',
-    margin: 0,
-    color: '#7FDBFF',
-  },
-  legend: {
-    display: 'flex',
-    gap: '1.5vw',
-    fontSize: '1.8vh',
-    flexWrap: 'wrap',
-  },
-  legendItem: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.5vw',
-  },
-  legendSwatch: {
-    display: 'inline-block',
-    width: '1.8vh',
-    height: '1.8vh',
-    borderRadius: '0.4vh',
-  },
-  emptySchedule: {
-    flex: 1,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    fontSize: '3vh',
-    color: '#7FDBFF',
-  },
-  slotGrid: {
-    flex: 1,
-    display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fill, minmax(11vw, 1fr))',
-    gridAutoRows: 'minmax(10vh, 1fr)',
-    gap: '1vh',
-    overflowY: 'auto',
-  },
-  slotCard: {
-    borderRadius: '1.2vh',
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: '1vh',
-    textAlign: 'center',
-    position: 'relative',
-  },
-  slotCardCalled: {
-    outline: '0.5vh solid #ffffff',
-    outlineOffset: '-0.5vh',
-  },
-  slotTime: {
-    fontSize: '2vh',
-    fontWeight: '800',
-    lineHeight: 1.2,
-  },
-  slotRemaining: {
-    fontSize: '1.7vh',
-    fontWeight: '700',
-    marginTop: '0.6vh',
-  },
-  slotCalledBadge: {
-    marginTop: '0.6vh',
-    fontSize: '1.4vh',
-    fontWeight: '900',
-    backgroundColor: 'rgba(0,0,0,0.25)',
-    padding: '0.2vh 0.8vh',
-    borderRadius: '999px',
-  },
-};
