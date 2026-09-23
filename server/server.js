@@ -372,8 +372,86 @@ app.post('/api/reserve', async (req, res) => {
                 const counterRef =
                     db.doc(COUNTER_DOC);
 
+                const stockLimitsRef =
+                    db.doc('settings/stockLimits');
+
+                const salesStatsRef =
+                    db.doc('settings/salesStats');
+
+                // ----------------------------------------------
+                // 必要なデータをすべて読む
+                // ※ Transactionでは書き込みより先に読む
+                // ----------------------------------------------
+
                 const counterDoc =
                     await transaction.get(counterRef);
+
+                const stockLimitsDoc =
+                    await transaction.get(stockLimitsRef);
+
+                const salesStatsDoc =
+                    await transaction.get(salesStatsRef);
+
+                // ----------------------------------------------
+                // 在庫上限
+                // ----------------------------------------------
+
+                if (!stockLimitsDoc.exists) {
+                    const error = new Error(
+                        '在庫上限設定が見つかりません。'
+                    );
+
+                    error.code = 'STOCK_LIMIT_NOT_FOUND';
+
+                    throw error;
+                }
+
+                const stockLimitsData =
+                    stockLimitsDoc.data();
+
+                const stockLimit =
+                    Number(stockLimitsData.yakisoba ?? 0);
+
+                // ----------------------------------------------
+                // 現在の販売数
+                // ----------------------------------------------
+
+                const salesStatsData =
+                    salesStatsDoc.exists
+                        ? salesStatsDoc.data()
+                        : {};
+
+                const currentSold =
+                    Number(salesStatsData.yakisoba ?? 0);
+
+                // ----------------------------------------------
+                // 今回の予約数
+                // ----------------------------------------------
+
+                const newSold =
+                    currentSold + numQuantity;
+
+                // ----------------------------------------------
+                // 在庫上限チェック
+                // ----------------------------------------------
+
+                if (newSold > stockLimit) {
+
+                    const error = new Error(
+                        `在庫不足です。残り ${Math.max(
+                            0,
+                            stockLimit - currentSold
+                        )} 個です。`
+                    );
+
+                    error.code = 'INSUFFICIENT_STOCK';
+
+                    throw error;
+                }
+
+                // ----------------------------------------------
+                // 予約番号
+                // ----------------------------------------------
 
                 let currentNumber = 1;
 
@@ -386,13 +464,15 @@ app.post('/api/reserve', async (req, res) => {
                         typeof data.currentNumber ===
                         'number'
                     ) {
-
                         currentNumber =
                             data.currentNumber + 1;
                     }
                 }
 
-                // カウンター更新
+                // ----------------------------------------------
+                // 予約番号カウンター更新
+                // ----------------------------------------------
+
                 transaction.set(
                     counterRef,
                     {
@@ -405,7 +485,10 @@ app.post('/api/reserve', async (req, res) => {
                     }
                 );
 
+                // ----------------------------------------------
                 // 予約作成
+                // ----------------------------------------------
+
                 const reservationRef =
                     db.collection('reservations').doc();
 
@@ -438,6 +521,25 @@ app.post('/api/reserve', async (req, res) => {
                     }
                 );
 
+                // ----------------------------------------------
+                // salesStats 更新
+                //
+                // 「初期在庫」を足すのではなく、
+                // 「今回予約された数」だけ足す
+                // ----------------------------------------------
+
+                transaction.set(
+                    salesStatsRef,
+                    {
+                        yakisoba: newSold,
+                        updatedAt:
+                            admin.firestore.FieldValue.serverTimestamp()
+                    },
+                    {
+                        merge: true
+                    }
+                );
+
                 return currentNumber;
             });
 
@@ -460,6 +562,13 @@ app.post('/api/reserve', async (req, res) => {
             'Error creating reservation:',
             error
         );
+
+        // 在庫不足や設定エラー等の独自エラーの場合はそのメッセージを返す
+        if (error.code === 'INSUFFICIENT_STOCK' || error.code === 'STOCK_LIMIT_NOT_FOUND') {
+            return res.status(400).json({
+                error: error.message
+            });
+        }
 
         return res.status(500).json({
             error: '予約の登録に失敗しました。'
