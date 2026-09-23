@@ -8,7 +8,7 @@ import { getFirestore, doc, onSnapshot } from 'firebase/firestore';
 // ====================================================================
 
 // 🚨 【要変更】あなたのRenderサーバーのURLに置き換えてください
-const SERVER_URL = "https://yakisoba-lvls.onrender.com";
+const SERVER_URL = "https://yakisoba-1.onrender.com";
 
 // 🚨 【要変更】LINE友だち追加用QRコード画像のURLに置き換えてください
 const LINE_QR_CODE_URL = '/QRRCODE.png';

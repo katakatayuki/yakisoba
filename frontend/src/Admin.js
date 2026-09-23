@@ -9,7 +9,7 @@ import { getFirestore, collection, query, onSnapshot, doc, updateDoc, orderBy } 
 import { setLogLevel } from 'firebase/firestore';
 
 // 🚨 【要変更】あなたのRenderサーバーのURLに置き換えてください
-const API_BASE_URL = 'https://yakisoba-lvls.onrender.com';
+const API_BASE_URL = 'https://yakisoba-1.onrender.com';
 
 // --------------------------------------------------------------------------------
 // Firebase設定の読み込み
