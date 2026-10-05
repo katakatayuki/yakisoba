@@ -193,6 +193,7 @@ function Login() {
 export default function App() {
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
+  const [compactHeader, setCompactHeader] = useState(() => window.innerWidth < 640);
   const route = useHashRoute();
   const [, forceRender] = useState(0);
 
@@ -201,6 +202,12 @@ export default function App() {
     const onChanged = () => forceRender((n) => n + 1);
     window.addEventListener(ACCOUNTS_CHANGED, onChanged);
     return () => window.removeEventListener(ACCOUNTS_CHANGED, onChanged);
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => setCompactHeader(window.innerWidth < 640);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
   }, []);
 
   useEffect(() => {
@@ -237,14 +244,14 @@ export default function App() {
 
   return (
     <div style={S.app}>
-      <header style={S.header}>
-        <a href="#/" style={S.headerBrand}><span style={S.brandMark}>n</span><span>なめらかなSNS</span></a>
-        <nav style={S.nav}>
-          <a href="#/" style={S.navLink}>ホーム</a>
-          <a href="#/new" style={S.postLink}>＋ 投稿する</a>
+      <header style={{ ...S.header, ...(compactHeader ? S.headerCompact : null) }}>
+        <a href="#/" style={{ ...S.headerBrand, ...(compactHeader ? S.headerBrandCompact : null) }}><span style={S.brandMark}>n</span><span>{compactHeader ? 'なめらか' : 'なめらかなSNS'}</span></a>
+        <nav style={{ ...S.nav, ...(compactHeader ? S.navCompact : null) }}>
+          {!compactHeader && <a href="#/" style={S.navLink}>ホーム</a>}
+          <a href="#/new" style={{ ...S.postLink, ...(compactHeader ? S.postLinkCompact : null) }}>＋ <span>{compactHeader ? '投稿' : '投稿する'}</span></a>
           <AccountSwitcher user={user} />
-          <span style={S.userPill}><span style={S.userInitial}>{Array.from(user.displayName || user.email || 'な')[0]}</span><span style={S.who}>{user.displayName || user.email}</span></span>
-          <button type="button" style={S.logout} onClick={() => signOut(auth)}>ログアウト</button>
+          {!compactHeader && <span style={S.userPill}><span style={S.userInitial}>{Array.from(user.displayName || user.email || 'な')[0]}</span><span style={S.who}>{user.displayName || user.email}</span></span>}
+          {!compactHeader && <button type="button" style={S.logout} onClick={() => signOut(auth)}>ログアウト</button>}
         </nav>
       </header>
       {/* アカウントが変わったら画面を作り直し、購読を新しいユーザーでやり直す */}
@@ -272,10 +279,14 @@ const S = {
     position: 'sticky', top: 0, zIndex: 40, backdropFilter: 'blur(12px)',
   },
   headerBrand: { display: 'inline-flex', alignItems: 'center', gap: 8, fontFamily: THEME.serif, fontWeight: 700, fontSize: '1.1rem', color: THEME.ink, textDecoration: 'none', letterSpacing: '0.02em' },
+  headerCompact: { minHeight: 42, padding: '0.4rem 0.65rem', flexWrap: 'nowrap' },
+  headerBrandCompact: { gap: 5, fontSize: '0.92rem', whiteSpace: 'nowrap' },
   brandMark: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: '#1f4fd8', color: '#fff', fontFamily: THEME.sans, fontWeight: 800, fontSize: '1rem' },
   nav: { display: 'flex', alignItems: 'center', gap: '0.65rem', flexWrap: 'wrap' },
+  navCompact: { gap: '0.35rem', flexWrap: 'nowrap' },
   navLink: { color: THEME.muted, fontWeight: 600, textDecoration: 'none', fontSize: '0.88rem', padding: '0.4rem 0.5rem' },
   postLink: { color: '#fff', backgroundColor: '#1f4fd8', fontWeight: 700, textDecoration: 'none', fontSize: '0.86rem', padding: '0.45rem 0.8rem', borderRadius: 999 },
+  postLinkCompact: { fontSize: '0.78rem', padding: '0.36rem 0.55rem' },
   userPill: { display: 'inline-flex', alignItems: 'center', gap: 6, maxWidth: 180 },
   userInitial: { width: 24, height: 24, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: '50%', backgroundColor: '#e8efff', color: '#1f4fd8', fontSize: '0.78rem', fontWeight: 700, flexShrink: 0 },
   who: { color: THEME.muted, fontSize: '0.84rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },

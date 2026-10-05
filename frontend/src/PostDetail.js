@@ -9,7 +9,7 @@ import {
   SCORES,
   formatDate, clip,
 } from './lib';
-import ClaimCard from './ClaimCard';
+import ClaimCard, { SourcesBox } from './ClaimCard';
 
 // ====================================================================
 // 投稿詳細画面
@@ -417,9 +417,11 @@ export default function PostDetail({ postId, user, isFirst }) {
             onSelectClaim={setSelectedId}
             boundaries={showBoundaries ? boundaries : null}
             annotations={annotations}
+            sources={sources}
             user={user}
             act={act}
             myReactions={myReactions}
+            myEvals={myEvals}
           />
         </article>
 
@@ -449,7 +451,7 @@ export default function PostDetail({ postId, user, isFirst }) {
 
 function BodyView({
   text, claims, myColors, selectedId, highlight, cursor, markStart,
-  bodyRef, cursorRef, onMouseUp, onSelectClaim, boundaries, annotations, user, act, myReactions,
+  bodyRef, cursorRef, onMouseUp, onSelectClaim, boundaries, annotations, sources, user, act, myReactions, myEvals,
 }) {
   const claimsById = useMemo(() => new Map(claims.map((c) => [c.id, c])), [claims]);
   const pieces = useMemo(
@@ -469,13 +471,7 @@ function BodyView({
 
   const cursorEl = <span ref={cursorRef} style={S.cursor} />;
 
-  const claimsEndingAt = new Map();
-  claims.forEach((claim) => {
-    if (!myColors[claim.id]) return;
-    const ending = claimsEndingAt.get(claim.endIndex) || [];
-    ending.push(claim);
-    claimsEndingAt.set(claim.endIndex, ending);
-  });
+  const selectedClaim = claimsById.get(selectedId);
 
   return (
     <div ref={bodyRef} onMouseUp={onMouseUp} style={S.body}>
@@ -505,7 +501,7 @@ function BodyView({
         if (covering.length > 0) style.cursor = 'pointer';
 
         const boundaryCount = boundaries && boundaries.count[p.end];
-        const endingClaims = claimsEndingAt.get(p.end) || [];
+        const endingClaim = selectedClaim && selectedClaim.endIndex === p.end ? selectedClaim : null;
 
         return (
           <React.Fragment key={p.start}>
@@ -519,17 +515,18 @@ function BodyView({
                 style={{ ...S.boundaryMark, opacity: 0.25 + (boundaryCount / boundaries.max) * 0.75 }}
               />
             )}
-            {endingClaims.map((claim) => (
-              <InlineThought
-                key={claim.id}
-                claim={claim}
-                color={myColors[claim.id]}
+            {endingClaim && (
+              <InlineClaimFlow
+                claim={endingClaim}
+                color={myColors[endingClaim.id]}
                 annotations={annotations}
+                sources={sources}
                 user={user}
                 act={act}
-                reaction={myReactions[claim.id]}
+                reaction={myReactions[endingClaim.id]}
+                myEvals={myEvals}
               />
-            ))}
+            )}
           </React.Fragment>
         );
       })}
@@ -540,7 +537,7 @@ function BodyView({
 
 // 本文の線の直下に、その線を引いた本人の言葉を置く。
 // 「どこに、どう反応したか」をスクロールの途中でも見失わないための小さな余白。
-function InlineThought({ claim, color, annotations, user, act, reaction }) {
+function InlineClaimFlow({ claim, color, annotations, sources, user, act, reaction, myEvals }) {
   const [editing, setEditing] = useState(false);
   const [body, setBody] = useState('');
   const [busy, setBusy] = useState(false);
@@ -548,6 +545,19 @@ function InlineThought({ claim, color, annotations, user, act, reaction }) {
     .filter((a) => a.claimId === claim.id && a.authorId === user.uid && !a.parentId)
     .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
   const current = reaction ? SCORES.find((score) => score.value === reaction.score) : null;
+
+  const setLine = (nextColor) => act(
+    () => api('/api/claims', {
+      method: 'POST',
+      body: { postId: claim.postId, startIndex: claim.startIndex, endIndex: claim.endIndex, color: nextColor },
+    }),
+    'この箇所に線を引きました。'
+  );
+
+  const setReaction = (score) => act(
+    () => api(`/api/claims/${claim.id}/reaction`, { method: 'PUT', body: { score, confidence: reaction?.confidence ?? null } }),
+    'この主張への評価を記録しました。'
+  );
 
   const submit = async (event) => {
     event.preventDefault();
@@ -565,35 +575,62 @@ function InlineThought({ claim, color, annotations, user, act, reaction }) {
   };
 
   return (
-    <aside style={{ ...S.inlineThought, borderLeftColor: PEN[color].ink }}>
-      <div style={S.inlineThoughtHead}>
-        <span style={{ ...S.inlineDot, backgroundColor: PEN[color].ink }} />
-        <b>あなたの余白</b>
-        {current && <span style={S.inlineReaction}>{current.short}</span>}
+    <aside style={{ ...S.inlineThought, borderLeftColor: color ? PEN[color].ink : '#1f4fd8' }}>
+      <div style={S.flowLabel}>あなたの線:</div>
+      <div style={S.flowPens}>
+        {PEN_KEYS.map((key) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => (color ? act(() => api(`/api/markings/${claim.id}`, { method: 'PUT', body: { color: key } })) : setLine(key))}
+            style={{ ...S.flowPen, borderColor: PEN[key].ink, color: PEN[key].ink, backgroundColor: color === key ? PEN[key].tint : '#fff', fontWeight: color === key ? 700 : 400 }}
+          >
+            {PEN[key].label}
+          </button>
+        ))}
       </div>
-      {mine.slice(0, 2).map((note) => <div key={note.id} style={S.inlineThoughtText}>{note.body}</div>)}
-      {mine.length === 0 && !editing && (
-        <button type="button" style={S.inlineWrite} onClick={() => setEditing(true)}>この線に、考えを書く</button>
-      )}
-      {mine.length > 0 && !editing && (
-        <button type="button" style={S.inlineWrite} onClick={() => setEditing(true)}>もう一つ書く</button>
-      )}
-      {editing && (
-        <form onSubmit={submit} style={S.inlineForm}>
-          <textarea
-            autoFocus
-            rows={2}
-            maxLength={2000}
-            value={body}
-            onChange={(event) => setBody(event.target.value)}
-            placeholder="この箇所を読んで考えたことを書く"
-            style={S.inlineTextarea}
-          />
-          <div style={S.inlineButtons}>
-            <button type="submit" disabled={busy || !body.trim()} style={S.inlineSubmit}>{busy ? '保存中…' : '余白に残す'}</button>
-            <button type="button" onClick={() => { setEditing(false); setBody(''); }} style={S.inlineCancel}>閉じる</button>
+
+      {color && (
+        <div style={S.flowStep}>
+          <div style={S.flowLabel}>この主張への評価</div>
+          <div style={S.flowScores}>
+            {[...SCORES].reverse().map((score) => {
+              const active = reaction?.score === score.value;
+              return <button key={score.value} type="button" onClick={() => setReaction(score.value)} style={{ ...S.flowScore, ...(active ? S.flowScoreActive : null) }}>{score.short}</button>;
+            })}
           </div>
-        </form>
+          {current && <div style={S.flowCurrent}>いまの評価: {current.label}</div>}
+        </div>
+      )}
+
+      {color && reaction && (
+        <div style={S.flowStep}>
+          {mine.slice(0, 2).map((note) => <div key={note.id} style={S.inlineThoughtText}>{note.body}</div>)}
+          {!editing && <button type="button" style={S.inlineWrite} onClick={() => setEditing(true)}>{mine.length ? 'もう一つ、考えを書く' : 'この線に、考えを書く'}</button>}
+          {editing && (
+            <>
+              <form onSubmit={submit} style={S.inlineForm}>
+                <textarea
+                  autoFocus
+                  rows={2}
+                  maxLength={2000}
+                  value={body}
+                  onChange={(event) => setBody(event.target.value)}
+                  placeholder="この箇所を読んで考えたことを書く"
+                  style={S.inlineTextarea}
+                />
+                <div style={S.inlineButtons}>
+                  <button type="submit" disabled={busy || !body.trim()} style={S.inlineSubmit}>{busy ? '保存中…' : '余白に残す'}</button>
+                  <button type="button" onClick={() => { setEditing(false); setBody(''); }} style={S.inlineCancel}>閉じる</button>
+                </div>
+              </form>
+              <div style={S.inlineSources}>
+                <div style={S.flowLabel}>出典を添える</div>
+                <SourcesBox claim={claim} sources={sources} myEvals={myEvals} user={user} act={act} />
+              </div>
+            </>
+          )}
+        </div>
       )}
     </aside>
   );
@@ -780,4 +817,13 @@ const S = {
   inlineButtons: { display: 'flex', gap: 6, marginTop: 6 },
   inlineSubmit: { border: 'none', borderRadius: 999, padding: '0.35rem 0.8rem', backgroundColor: '#1f4fd8', color: '#fff', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 700, fontSize: '0.8rem' },
   inlineCancel: { border: 'none', background: 'transparent', color: THEME.muted, cursor: 'pointer', fontFamily: 'inherit', fontSize: '0.8rem' },
+  flowLabel: { color: THEME.ink, fontSize: '0.84rem', fontWeight: 700, marginBottom: 6 },
+  flowPens: { display: 'flex', gap: 6, flexWrap: 'wrap' },
+  flowPen: { border: '1.5px solid', borderRadius: 999, padding: '0.32rem 0.65rem', cursor: 'pointer', fontFamily: 'inherit', fontSize: '0.8rem' },
+  flowStep: { marginTop: 12, paddingTop: 11, borderTop: `1px solid ${THEME.rule}` },
+  flowScores: { display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 4 },
+  flowScore: { minHeight: 34, border: `1px solid ${THEME.rule}`, borderRadius: 8, background: '#fff', color: THEME.muted, cursor: 'pointer', fontFamily: 'inherit', fontSize: '0.72rem' },
+  flowScoreActive: { backgroundColor: THEME.ink, borderColor: THEME.ink, color: '#fff', fontWeight: 700 },
+  flowCurrent: { marginTop: 6, color: THEME.muted, fontSize: '0.78rem' },
+  inlineSources: { marginTop: 12, paddingTop: 10, borderTop: `1px solid ${THEME.rule}` },
 };

@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 
 import { api } from './firebase';
-import { THEME, PEN, PEN_KEYS, SCORES, signed, toMillis } from './lib';
+import { THEME, PEN, SCORES, signed, toMillis } from './lib';
 import { U, MiniBar, EvalButtons, SCORE_COLOR, ACCENT } from './ui';
 import Marginalia, { PrivateNotesTab } from './Marginalia';
 
@@ -43,6 +43,7 @@ const C = {
   meta: { padding: '0 16px 14px 52px' },
   stats: { ...U.faint, marginTop: 6 },
   body: { padding: '0 16px 16px', borderTop: `1px solid ${THEME.rule}` },
+  bodyGuide: { padding: '12px 0 2px', color: THEME.muted, fontSize: '0.84rem', lineHeight: 1.6 },
   penRow: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', padding: '12px 0' },
   penChip: { border: '1.5px solid', borderRadius: 999, padding: '2px 12px', cursor: 'pointer', fontSize: '0.8rem', background: 'transparent', fontFamily: 'inherit' },
   tabs: { display: 'flex', gap: 2, overflowX: 'auto', borderBottom: `1px solid ${THEME.rule}`, marginBottom: 14 },
@@ -98,27 +99,15 @@ export default function ClaimCard({
   claim, label, expanded, onToggle, user, myColor, myReaction, myEvals,
   annotations, sources, notes, notesReady, act,
 }) {
-  const [writing, setWriting] = useState(false);
   const [communityOpen, setCommunityOpen] = useState(false);
   const [memoOpen, setMemoOpen] = useState(false);
 
   useEffect(() => {
     if (!expanded) {
-      setWriting(false);
       setCommunityOpen(false);
       setMemoOpen(false);
     }
   }, [expanded]);
-
-  const changeColor = (color) => act(() => api(`/api/markings/${claim.id}`, { method: 'PUT', body: { color } }));
-  const removeMark = () => act(() => api(`/api/markings/${claim.id}`, { method: 'DELETE' }), '線を消しました。');
-  const addMark = (color) => act(
-    () => api('/api/claims', {
-      method: 'POST',
-      body: { postId: claim.postId, startIndex: claim.startIndex, endIndex: claim.endIndex, color },
-    }),
-    'この主張に線を引きました。'
-  );
 
   return (
     <article id={`claim-${claim.id}`} style={{ ...C.card, ...(expanded ? C.cardOpen : null) }}>
@@ -148,55 +137,7 @@ export default function ClaimCard({
 
       {expanded && (
         <div style={C.body}>
-          <div style={C.penRow}>
-            <span style={U.faint}>{myColor ? 'あなたの線:' : 'この主張に線を引く:'}</span>
-            {PEN_KEYS.map((key) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => (myColor ? changeColor(key) : addMark(key))}
-                style={{
-                  ...C.penChip,
-                  borderColor: PEN[key].ink,
-                  color: PEN[key].ink,
-                  backgroundColor: myColor === key ? PEN[key].tint : 'transparent',
-                  fontWeight: myColor === key ? 700 : 400,
-                }}
-              >
-                {PEN[key].label}
-              </button>
-            ))}
-            {myColor && <button type="button" style={U.linkBtn} onClick={removeMark}>線を消す</button>}
-          </div>
-
-          <ReactionBox claim={claim} myReaction={myReaction} act={act} mode="personal" />
-
-          <button type="button" style={{ ...C.actionButton, ...(writing ? C.actionButtonOpen : null) }} onClick={() => setWriting((value) => !value)}>
-            <span style={C.actionIcon}>✎</span>
-            <span><b>余白に書く</b><small>この主張を読んで、自分が考えたことを残す</small></span>
-            <span style={C.actionArrow}>{writing ? '−' : '＋'}</span>
-          </button>
-
-          {writing && (
-            <div style={C.writerPanel}>
-              <Marginalia
-                claim={claim}
-                annotations={annotations}
-                notes={notes}
-                myEvals={myEvals}
-                myColor={myColor}
-                hasReaction={!!myReaction}
-                user={user}
-                act={act}
-                ownOnly
-              />
-              <div style={C.sourceInMargin}>
-                <div style={C.insetTitle}>出典を添える</div>
-                <div style={U.faint}>この余白の背景にある資料やデータを、必要なときだけ追加できます。</div>
-                <SourcesBox claim={claim} sources={sources} myEvals={myEvals} user={user} act={act} />
-              </div>
-            </div>
-          )}
+          <div style={C.bodyGuide}>線・評価・あなたの余白は、本文のすぐ下で入力できます。</div>
 
           <div style={C.moreActions}>
             <button type="button" style={{ ...C.secondaryAction, ...(communityOpen ? C.secondaryActionOpen : null) }} onClick={() => setCommunityOpen((value) => !value)}>
@@ -325,7 +266,7 @@ function ReactionBox({ claim, myReaction, act, mode = 'personal' }) {
 // 出典 (§17, §18, §36)
 // ====================================================================
 
-function SourcesBox({ claim, sources, myEvals, user, act, allowAdd = true }) {
+export function SourcesBox({ claim, sources, myEvals, user, act, allowAdd = true }) {
   const [open, setOpen] = useState(false);
   const sorted = [...sources].sort((a, b) => (b.bridgeScore || 0) - (a.bridgeScore || 0)
     || toMillis(a.createdAt) - toMillis(b.createdAt));
