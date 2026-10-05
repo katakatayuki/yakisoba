@@ -14,6 +14,7 @@ import { THEME } from './lib';
 import Home from './Home';
 import PostCreate from './PostCreate';
 import PostDetail from './PostDetail';
+import { TestAccountStart, AccountSwitcher, ACCOUNTS_CHANGED } from './TestAccounts';
 
 // ====================================================================
 // ハッシュルーター (追加ライブラリなし)
@@ -47,6 +48,9 @@ const AUTH_ERRORS = {
   'auth/invalid-email': 'メールアドレスの形式が正しくありません。',
   'auth/popup-closed-by-user': 'ログインがキャンセルされました。',
   'auth/too-many-requests': '試行回数が多すぎます。しばらく待ってからお試しください。',
+  'auth/operation-not-allowed': 'このログイン方法がFirebaseコンソールで有効になっていません。',
+  'auth/unauthorized-domain': 'このサイトのドメインがFirebaseの「承認済みドメイン」に入っていません。',
+  'auth/network-request-failed': 'ネットワークに接続できませんでした。',
 };
 
 // ====================================================================
@@ -63,7 +67,7 @@ function Login() {
 
   const fail = (e) => {
     console.error(e);
-    setError(AUTH_ERRORS[e.code] || 'ログインに失敗しました。もう一度お試しください。');
+    setError(AUTH_ERRORS[e.code] || `ログインに失敗しました。(${e.code || e.message})`);
   };
 
   const registerProfile = (name) =>
@@ -118,6 +122,8 @@ function Login() {
           <br />
           「賛成か反対か」ではなく、「この主張には賛成、ここは保留」と言える場所です。
         </p>
+
+        <TestAccountStart />
 
         <form onSubmit={submit}>
           {mode === 'signup' && (
@@ -188,6 +194,14 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const route = useHashRoute();
+  const [, forceRender] = useState(0);
+
+  // テストアカウント作成直後に表示名を反映するための再描画
+  useEffect(() => {
+    const onChanged = () => forceRender((n) => n + 1);
+    window.addEventListener(ACCOUNTS_CHANGED, onChanged);
+    return () => window.removeEventListener(ACCOUNTS_CHANGED, onChanged);
+  }, []);
 
   useEffect(() => {
     if (!auth) {
@@ -227,11 +241,13 @@ export default function App() {
         <a href="#/" style={S.headerBrand}>なめらかなSNS</a>
         <nav style={S.nav}>
           <a href="#/new" style={S.navLink}>投稿する</a>
+          <AccountSwitcher user={user} />
           <span style={S.who}>{user.displayName || user.email}</span>
           <button type="button" style={S.logout} onClick={() => signOut(auth)}>ログアウト</button>
         </nav>
       </header>
-      {screen}
+      {/* アカウントが変わったら画面を作り直し、購読を新しいユーザーでやり直す */}
+      <React.Fragment key={user.uid}>{screen}</React.Fragment>
     </div>
   );
 }

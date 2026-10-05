@@ -51,7 +51,7 @@ const IOU_THRESHOLD = 0.8;          // 同一の主張候補とみなす重な�
 const MAX_TITLE = 100;
 const MAX_BODY = 20000;
 const MAX_CLAIM_LENGTH = 1000;
-const MAX_COMMENT = 2000;
+const MAX_COMMENT = 200000;
 
 const COLORS = ['blue', 'red', 'green'];                                       // §12
 const SCORES = [-2, -1, 0, 1, 2];                                              // §13

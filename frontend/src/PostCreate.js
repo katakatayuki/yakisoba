@@ -12,7 +12,7 @@ import { THEME } from './lib';
 // ====================================================================
 
 const MAX_TITLE = 100; // server.js と同じ
-const MAX_BODY = 20000; // server.js と同じ
+const MAX_BODY = 2000000; // server.js と同じ
 
 export default function PostCreate() {
   const [title, setTitle] = useState('');
