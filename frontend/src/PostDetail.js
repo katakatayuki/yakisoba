@@ -3,18 +3,16 @@ import { collection, doc, onSnapshot, query, where } from 'firebase/firestore';
 
 import { db, api } from './firebase';
 import {
-  THEME, PEN, PEN_KEYS, SCORES, ANNOTATION_TYPES, EVAL_TYPES, MIN_EVALS,
+  THEME, PEN, PEN_KEYS,
   buildPieces, selectionToRange, pointToIndex, snapToPunctuation,
   nextSentenceEnd, prevSentenceEnd, computePatterns,
-  formatDate, toMillis, signed, clip,
+  formatDate, clip,
 } from './lib';
+import ClaimCard from './ClaimCard';
 
 // ====================================================================
-// 投稿詳細画面 (旧 Admin.js: 複数コレクションを onSnapshot で購読し、
-//   画面からサーバーAPIを呼んで状態を更新する管理画面)
-//
-// 最も重要な画面 (企画書 §45)。
-//   読む → 線を引く → 考える → 書く → 他人の線を見る
+// 投稿詳細画面
+// 読む → 線を引く → 考える → 書く → 他人の線を見る
 // ====================================================================
 
 function useIsNarrow(breakpoint = 960) {
@@ -41,6 +39,8 @@ export default function PostDetail({ postId, user, isFirst }) {
   const [markings, setMarkings] = useState([]);
   const [annotations, setAnnotations] = useState([]);
   const [sources, setSources] = useState([]);
+  const [notes, setNotes] = useState([]);
+  const [notesReady, setNotesReady] = useState(false);
   const [myReactions, setMyReactions] = useState({}); // claimId -> reaction
   const [myEvals, setMyEvals] = useState({}); // `${targetType}_${targetId}` -> type
   const [loading, setLoading] = useState(true);
@@ -73,8 +73,6 @@ export default function PostDetail({ postId, user, isFirst }) {
 
   // ----------------------------------------------------------------
   // Firestore 購読
-  // 反応(reactions)と有用性評価(evaluations)は本人分だけ読む。
-  // 他の人の分は、サーバーが集計して claim / annotation / source に書き込んだ値を使う。
   // ----------------------------------------------------------------
   useEffect(() => {
     setLoading(true);
@@ -106,6 +104,13 @@ export default function PostDetail({ postId, user, isFirst }) {
       onSnapshot(mine('evaluations'), (s) => {
         setMyEvals(Object.fromEntries(toList(s).map((e) => [`${e.targetType}_${e.targetId}`, e.type])));
       }, fail('有用性評価')),
+      onSnapshot(mine('notes'), (s) => {
+        setNotes(toList(s));
+        setNotesReady(true);
+      }, (err) => {
+        console.error('メモの購読エラー:', err);
+        setNotesReady(true);
+      }),
     ];
 
     return () => unsubs.forEach((u) => u());
@@ -114,7 +119,6 @@ export default function PostDetail({ postId, user, isFirst }) {
   // ----------------------------------------------------------------
   // 派生データ
   // ----------------------------------------------------------------
-  // 誰も線を引いておらず、反応も注釈もない主張は表示しない
   const visibleClaims = useMemo(
     () => claims
       .filter((c) => (c.usageCount || 0) > 0 || (c.reactionTotal || 0) > 0
@@ -134,7 +138,6 @@ export default function PostDetail({ postId, user, isFirst }) {
   );
 
   const patterns = useMemo(() => computePatterns(visibleClaims, markings), [visibleClaims, markings]);
-  const selected = visibleClaims.find((c) => c.id === selectedId) || null;
 
   const highlight = useMemo(() => {
     if (markStart !== null && cursor !== null) {
@@ -142,6 +145,16 @@ export default function PostDetail({ postId, user, isFirst }) {
     }
     return pending ? { ...pending, live: false } : null;
   }, [markStart, cursor, pending]);
+
+  // 選択された主張へスクロール
+  useEffect(() => {
+    if (selectedId) {
+      const el = document.getElementById(`claim-${selectedId}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    }
+  }, [selectedId]);
 
   // ----------------------------------------------------------------
   // 通知と API 呼び出し
@@ -154,7 +167,6 @@ export default function PostDetail({ postId, user, isFirst }) {
 
   useEffect(() => () => clearTimeout(noticeTimer.current), []);
 
-  // API を呼び、失敗したら通知する。成功時は結果、失敗時は null を返す
   const act = useCallback(async (fn, okText) => {
     try {
       const result = await fn();
@@ -171,7 +183,6 @@ export default function PostDetail({ postId, user, isFirst }) {
   // ----------------------------------------------------------------
   const handleMouseUp = () => {
     if (mobileMode) return;
-    // ドラッグ直後に選択範囲が確定するまで待つ
     setTimeout(() => {
       const range = selectionToRange(bodyRef.current);
       if (range && range.end > range.start) {
@@ -181,7 +192,6 @@ export default function PostDetail({ postId, user, isFirst }) {
     }, 0);
   };
 
-  // スマホ: 画面の読み取り線(上から45%)にある文字へカーソルを合わせる
   const syncCursorFromViewport = useCallback(() => {
     const el = bodyRef.current;
     if (!el) return;
@@ -220,8 +230,6 @@ export default function PostDetail({ postId, user, isFirst }) {
     };
   }, [mobileMode, hasPost, pending, syncCursorFromViewport]);
 
-  // ボタン操作でカーソルを動かしたときだけ、その横位置を覚える
-  // (スクロール由来の位置を覚えると、句読点への吸着で横位置が少しずつずれていくため)
   useEffect(() => {
     if (cursorFromButton.current && cursorElRef.current) {
       cursorXRef.current = cursorElRef.current.getBoundingClientRect().left;
@@ -308,24 +316,28 @@ export default function PostDetail({ postId, user, isFirst }) {
     />
   );
 
-  const panelEl = selected ? (
-    <ClaimPanel
-      key={selected.id}
-      claim={selected}
-      label={labels[selected.id]}
-      user={user}
-      myColor={myColors[selected.id] || null}
-      myReaction={myReactions[selected.id] || null}
-      myEvals={myEvals}
-      annotations={annotations.filter((a) => a.claimId === selected.id)}
-      sources={sources.filter((s) => s.claimId === selected.id)}
-      act={act}
-    />
+  const panelEl = visibleClaims.length > 0 ? (
+    visibleClaims.map((c) => (
+      <ClaimCard
+        key={c.id}
+        claim={c}
+        label={labels[c.id]}
+        expanded={selectedId === c.id}
+        onToggle={() => setSelectedId((cur) => (cur === c.id ? null : c.id))}
+        user={user}
+        myColor={myColors[c.id] || null}
+        myReaction={myReactions[c.id] || null}
+        myEvals={myEvals}
+        annotations={annotations.filter((a) => a.claimId === c.id)}
+        sources={sources.filter((s) => s.claimId === c.id)}
+        notes={notes.filter((n) => n.claimId === c.id)}
+        notesReady={notesReady}
+        act={act}
+      />
+    ))
   ) : (
     <div style={S.panelEmpty}>
-      {visibleClaims.length === 0
-        ? '文章の気になる箇所に線を引くと、ここに主張が並び、評価やコメントを書けるようになります。'
-        : '線の引かれた箇所を押すか、一覧から主張を選んでください。'}
+      文章の気になる箇所に線を引くと、ここに主張が並び、評価やコメントを書けるようになります。
     </div>
   );
 
@@ -352,7 +364,7 @@ export default function PostDetail({ postId, user, isFirst }) {
         <article style={S.sheet}>
           <h1 style={S.title}>{post.title}</h1>
           <div style={S.meta}>
-            {post.authorName || 'ななしさん'}　{formatDate(post.createdAt)}
+            {post.authorName || 'ななしさん'} {formatDate(post.createdAt)}
           </div>
 
           {showFirst && (
@@ -437,9 +449,7 @@ export default function PostDetail({ postId, user, isFirst }) {
 }
 
 // ====================================================================
-// 本文
-// 本文コンテナの中には、本文以外のテキストを置かないこと
-// (文字位置の計算がずれるため。カーソルは中身のない span で描画する)
+// 本文描画コンポーネント
 // ====================================================================
 
 function BodyView({
@@ -454,10 +464,9 @@ function BodyView({
 
   const handlePick = (covering) => {
     const sel = window.getSelection();
-    if (sel && !sel.isCollapsed) return; // ドラッグ選択の直後は無視
+    if (sel && !sel.isCollapsed) return;
     if (covering.length === 0) return;
 
-    // 重なっている主張は、押すたびに狭いほうから順に切り替える
     const sorted = [...covering].sort((a, b) => claimLength(a) - claimLength(b));
     const at = sorted.findIndex((c) => c.id === selectedId);
     onSelectClaim(sorted[(at + 1) % sorted.length].id);
@@ -466,11 +475,7 @@ function BodyView({
   const cursorEl = <span ref={cursorRef} style={S.cursor} />;
 
   return (
-    <div
-      ref={bodyRef}
-      onMouseUp={onMouseUp}
-      style={S.body}
-    >
+    <div ref={bodyRef} onMouseUp={onMouseUp} style={S.body}>
       {pieces.map((p) => {
         const covering = p.claimIds.map((id) => claimsById.get(id)).filter(Boolean);
         const mine = covering
@@ -481,7 +486,6 @@ function BodyView({
         if (mine.length > 0) {
           style.backgroundColor = PEN[myColors[mine[0].id]].tint;
         } else if (covering.length > 0) {
-          // 自分は線を引いていないが、他の人が引いている箇所
           style.textDecoration = 'underline dotted';
           style.textDecorationColor = THEME.faint;
           style.textUnderlineOffset = '5px';
@@ -512,8 +516,6 @@ function BodyView({
 
 // ====================================================================
 // 下部ツールバー
-//  - 範囲が決まったら: 色を選んで主張として登録 (§7)
-//  - スマホ(┃モード): カーソル移動と「マーク開始 / マーク終了」 (§8)
 // ====================================================================
 
 function MarkBar({ mobileMode, pending, highlight, markStart, text, cursor, onColor, onCancel, onMove, onStart, onFinish }) {
@@ -605,7 +607,7 @@ function ClaimList({ claims, labels, myColors, selectedId, onSelect }) {
               <span style={{ flex: 1, minWidth: 0 }}>
                 <span style={S.claimText}>{clip(c.text, 36)}</span>
                 <span style={S.claimSub}>
-                  線 {Math.max(0, c.usageCount || 0)}　評価 {c.reactionTotal || 0}　コメント {c.annotationCount || 0}
+                  線 {Math.max(0, c.usageCount || 0)} 評価 {c.reactionTotal || 0} コメント {c.annotationCount || 0}
                 </span>
               </span>
             </button>
@@ -617,8 +619,7 @@ function ClaimList({ claims, labels, myColors, selectedId, onSelect }) {
 }
 
 // ====================================================================
-// みんなの分割 (§10, §11, §30)
-// 多数派を正解にはしない。分け方ごとの採用率だけを示す。
+// みんなの分割
 // ====================================================================
 
 function SegmentationPanel({ patterns, claims, labels, myColors, adoptColor, onColor, onAdopt, onClose }) {
@@ -692,425 +693,7 @@ function SegmentationPanel({ patterns, claims, labels, myColors, adoptColor, onC
 }
 
 // ====================================================================
-// 右ペイン: 選んだ主張の詳細 (§29)
-//   主張 → マルジナリア → 評価 → 出典 の順 (§28 スマホ表示順)
-// ====================================================================
-
-function ClaimPanel({ claim, label, user, myColor, myReaction, myEvals, annotations, sources, act }) {
-  const changeColor = (color) => act(() => api(`/api/markings/${claim.id}`, { method: 'PUT', body: { color } }));
-  const removeMark = () => act(() => api(`/api/markings/${claim.id}`, { method: 'DELETE' }), '線を消しました。');
-  const addMark = (color) => act(
-    () => api('/api/claims', {
-      method: 'POST',
-      body: { postId: claim.postId, startIndex: claim.startIndex, endIndex: claim.endIndex, color },
-    }),
-    'この主張に線を引きました。'
-  );
-
-  return (
-    <div>
-      <blockquote style={{ ...S.quote, borderLeftColor: myColor ? PEN[myColor].ink : THEME.rule }}>
-        <span style={S.quoteLabel}>{label}</span>
-        {claim.text}
-      </blockquote>
-
-      <div style={S.penRow}>
-        <span style={S.faint}>{myColor ? 'あなたの線:' : 'この主張に線を引く:'}</span>
-        {PEN_KEYS.map((key) => (
-          <button
-            key={key}
-            type="button"
-            onClick={() => (myColor ? changeColor(key) : addMark(key))}
-            style={{
-              ...S.colorChip,
-              borderColor: PEN[key].ink,
-              backgroundColor: myColor === key ? PEN[key].tint : 'transparent',
-              color: PEN[key].ink,
-              fontWeight: myColor === key ? 700 : 400,
-            }}
-          >
-            {PEN[key].label}
-          </button>
-        ))}
-        {myColor && <button type="button" style={S.linkButton} onClick={removeMark}>線を消す</button>}
-      </div>
-
-      <Marginalia
-        claim={claim}
-        annotations={annotations}
-        myEvals={myEvals}
-        myColor={myColor}
-        hasReaction={!!myReaction}
-        user={user}
-        act={act}
-      />
-
-      <ReactionBox claim={claim} myReaction={myReaction} act={act} />
-
-      <SourcesBox claim={claim} sources={sources} myEvals={myEvals} user={user} act={act} />
-    </div>
-  );
-}
-
-// ---- 主張への評価 -2〜+2 (§13, §14, §25, §26) ----
-
-function ReactionBox({ claim, myReaction, act }) {
-  const saved = myReaction ? myReaction.score : undefined;
-  const savedConf = myReaction && myReaction.confidence !== undefined ? myReaction.confidence : null;
-
-  const [draft, setDraft] = useState(saved !== undefined ? saved : 0);
-  const [useConf, setUseConf] = useState(savedConf !== null);
-  const [conf, setConf] = useState(savedConf !== null ? savedConf : 50);
-
-  useEffect(() => {
-    setDraft(saved !== undefined ? saved : 0);
-    setUseConf(savedConf !== null);
-    setConf(savedConf !== null ? savedConf : 50);
-  }, [claim.id, saved, savedConf]);
-
-  const commit = (score, confidence) => {
-    if (score === saved && confidence === savedConf) return;
-    act(() => api(`/api/claims/${claim.id}/reaction`, { method: 'PUT', body: { score, confidence } }));
-  };
-
-  const pick = (value) => {
-    setDraft(value);
-    commit(value, useConf ? conf : null);
-  };
-
-  const toggleConf = (on) => {
-    setUseConf(on);
-    if (!on && saved !== undefined) commit(draft, null);
-  };
-
-  const counts = claim.reactionCounts || {};
-  const total = claim.reactionTotal || 0;
-  const current = SCORES.find((s) => s.value === draft);
-  const ticks = [...SCORES].reverse(); // 左が反対、右が賛成
-
-  const history = (myReaction && myReaction.history) || [];
-
-  return (
-    <section style={S.block}>
-      <h3 style={S.h3}>この主張へのあなたの評価</h3>
-
-      <div style={S.sliderLabel}>
-        {saved === undefined ? '未評価（動かすと保存されます）' : `${current.label}　${signed(draft)}`}
-      </div>
-      <input
-        type="range"
-        min={-2}
-        max={2}
-        step={1}
-        value={draft}
-        aria-label="この主張への評価"
-        onChange={(e) => setDraft(Number(e.target.value))}
-        onPointerUp={(e) => commit(Number(e.currentTarget.value), useConf ? conf : null)}
-        onKeyUp={(e) => commit(Number(e.currentTarget.value), useConf ? conf : null)}
-        style={S.range}
-      />
-      <div style={S.ticks}>
-        {ticks.map((s) => (
-          <button
-            key={s.value}
-            type="button"
-            onClick={() => pick(s.value)}
-            style={{ ...S.tick, ...(saved === s.value ? S.tickActive : null) }}
-          >
-            {s.short}
-          </button>
-        ))}
-      </div>
-
-      <label style={S.confToggle}>
-        <input type="checkbox" checked={useConf} onChange={(e) => toggleConf(e.target.checked)} />
-        確信度も記録する
-      </label>
-      {useConf && (
-        <div>
-          <div style={S.sliderLabel}>この判断への自信 {conf}%</div>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            step={1}
-            value={conf}
-            aria-label="確信度"
-            onChange={(e) => setConf(Number(e.target.value))}
-            onPointerUp={(e) => commit(draft, Number(e.currentTarget.value))}
-            onKeyUp={(e) => commit(draft, Number(e.currentTarget.value))}
-            style={S.range}
-          />
-        </div>
-      )}
-
-      <div style={S.dist}>
-        <div style={S.faint}>他の反応（{total} 人）</div>
-        {SCORES.map((s) => {
-          const n = counts[String(s.value)] || 0;
-          const pct = total ? Math.round((n / total) * 100) : 0;
-          return (
-            <div key={s.value} style={S.distRow}>
-              <span style={S.distName}>{s.short}{saved === s.value ? ' ●' : ''}</span>
-              <span style={S.distTrack}>
-                <span style={{ ...S.distFill, width: `${pct}%` }} />
-              </span>
-              <span style={S.distPct}>{pct}%</span>
-            </div>
-          );
-        })}
-      </div>
-
-      {history.length > 1 && (
-        <div style={S.history}>
-          あなたの評価の変化: {history.map((h) => signed(h.score)).join(' → ')}
-          <div style={S.faint}>考えが変わるのは自然なことです。この記録はあなたにだけ見えます。</div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-// ---- マルジナリア (§15, §16) ----
-
-function Marginalia({ claim, annotations, myEvals, myColor, hasReaction, user, act }) {
-  const bridged = annotations
-    .filter((a) => (a.bridgeScore || 0) > 0)
-    .sort((a, b) => b.bridgeScore - a.bridgeScore)
-    .slice(0, 3);
-  const bridgedIds = new Set(bridged.map((a) => a.id));
-  const rest = annotations
-    .filter((a) => !bridgedIds.has(a.id))
-    .sort((a, b) => toMillis(a.createdAt) - toMillis(b.createdAt));
-
-  return (
-    <section style={S.block}>
-      <h3 style={S.h3}>マルジナリア（この主張への余白）</h3>
-
-      {annotations.length === 0 && <div style={S.faint}>まだコメントはありません。</div>}
-
-      {bridged.length > 0 && (
-        <div style={S.bridgedBox}>
-          <div style={S.bridgedTitle}>🌉 橋渡しされた注釈</div>
-          {bridged.map((a) => (
-            <AnnotationItem key={a.id} item={a} myEvals={myEvals} user={user} act={act} />
-          ))}
-        </div>
-      )}
-
-      {rest.map((a) => (
-        <AnnotationItem key={a.id} item={a} myEvals={myEvals} user={user} act={act} />
-      ))}
-
-      {!hasReaction && annotations.length > 0 && (
-        <div style={S.footnote}>
-          橋渡しの指標に反映されるのは、この主張に自分の評価（下のスライダー）を入れた人の「有用」評価です。
-        </div>
-      )}
-
-      <AnnotationForm claim={claim} myColor={myColor} act={act} />
-    </section>
-  );
-}
-
-function AnnotationItem({ item, myEvals, user, act }) {
-  const type = ANNOTATION_TYPES.find((t) => t.value === item.type);
-  return (
-    <div style={{ ...S.annotation, borderLeftColor: item.color ? PEN[item.color].ink : THEME.rule }}>
-      <div style={S.annotationHead}>
-        <b>{item.authorName || 'ななしさん'}</b>
-        <span style={S.typeBadge}>{type ? type.label : item.type}</span>
-        <span style={S.faint}>{formatDate(item.createdAt)}</span>
-      </div>
-      <div style={S.annotationBody}>{item.body}</div>
-      <EvalButtons targetType="annotation" target={item} myEvals={myEvals} user={user} act={act} />
-    </div>
-  );
-}
-
-function AnnotationForm({ claim, myColor, act }) {
-  const [type, setType] = useState('opinion');
-  const [body, setBody] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  const submit = async (e) => {
-    e.preventDefault();
-    if (!body.trim()) return;
-    setBusy(true);
-    const result = await act(
-      () => api(`/api/claims/${claim.id}/annotations`, { method: 'POST', body: { type, body: body.trim() } }),
-      'マルジナリアに書きました。'
-    );
-    setBusy(false);
-    if (result) setBody('');
-  };
-
-  return (
-    <form onSubmit={submit} style={S.form}>
-      <div style={S.typeRow}>
-        {ANNOTATION_TYPES.map((t) => (
-          <button
-            key={t.value}
-            type="button"
-            onClick={() => setType(t.value)}
-            style={{ ...S.typeChip, ...(type === t.value ? S.typeChipActive : null) }}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
-      <textarea
-        style={{ ...S.textarea, borderLeft: `4px solid ${myColor ? PEN[myColor].ink : THEME.rule}` }}
-        rows={3}
-        maxLength={2000}
-        value={body}
-        onChange={(e) => setBody(e.target.value)}
-        placeholder="この主張について、考えたこと・疑問・根拠など"
-      />
-      <button type="submit" disabled={busy || !body.trim()} style={{ ...S.submit, ...((busy || !body.trim()) ? S.submitOff : null) }}>
-        {busy ? '送信中…' : 'マルジナリアに書く'}
-      </button>
-    </form>
-  );
-}
-
-// ---- 出典 (§17, §18, §36) ----
-
-function SourcesBox({ claim, sources, myEvals, user, act }) {
-  const [open, setOpen] = useState(false);
-  const sorted = [...sources].sort((a, b) => (b.bridgeScore || 0) - (a.bridgeScore || 0)
-    || toMillis(a.createdAt) - toMillis(b.createdAt));
-
-  return (
-    <section style={S.block}>
-      <h3 style={S.h3}>出典・反証</h3>
-      {sorted.length === 0 && <div style={S.faint}>まだ資料はありません。</div>}
-
-      {sorted.map((s) => (
-        <div key={s.id} style={S.source}>
-          <a href={s.url} target="_blank" rel="noopener noreferrer" style={S.sourceTitle}>{s.title}</a>
-          <div style={S.faint}>ユーザーが提示した資料　{s.authorName || 'ななしさん'}</div>
-          {s.evidenceLocation && <div style={S.sourceLine}><b>根拠箇所:</b> {s.evidenceLocation}</div>}
-          {s.description && <div style={S.sourceLine}><b>この資料が示していること:</b> {s.description}</div>}
-          {s.interpretation && <div style={S.sourceInterp}><b>投稿者の解釈:</b> {s.interpretation}</div>}
-          <EvalButtons targetType="source" target={s} myEvals={myEvals} user={user} act={act} />
-        </div>
-      ))}
-
-      {open ? (
-        <SourceForm claim={claim} act={act} onDone={() => setOpen(false)} />
-      ) : (
-        <button type="button" style={S.addSource} onClick={() => setOpen(true)}>資料を追加する</button>
-      )}
-    </section>
-  );
-}
-
-function SourceForm({ claim, act, onDone }) {
-  const [f, setF] = useState({ title: '', url: '', evidenceLocation: '', description: '', interpretation: '' });
-  const [busy, setBusy] = useState(false);
-  const set = (key) => (e) => setF((prev) => ({ ...prev, [key]: e.target.value }));
-
-  const submit = async (e) => {
-    e.preventDefault();
-    setBusy(true);
-    const result = await act(
-      () => api(`/api/claims/${claim.id}/sources`, { method: 'POST', body: f }),
-      '資料を追加しました。'
-    );
-    setBusy(false);
-    if (result) onDone();
-  };
-
-  return (
-    <form onSubmit={submit} style={S.form}>
-      <label style={S.fieldLabel}>
-        資料名
-        <input style={S.input} value={f.title} onChange={set('title')} maxLength={200} required />
-      </label>
-      <label style={S.fieldLabel}>
-        URL
-        <input style={S.input} type="url" value={f.url} onChange={set('url')} placeholder="https://" required />
-      </label>
-      <label style={S.fieldLabel}>
-        根拠箇所（表・ページなど）
-        <input style={S.input} value={f.evidenceLocation} onChange={set('evidenceLocation')} maxLength={200} />
-      </label>
-      <label style={S.fieldLabel}>
-        この資料が示していること
-        <textarea style={S.textarea} rows={2} value={f.description} onChange={set('description')} maxLength={1000} />
-      </label>
-      <label style={S.fieldLabel}>
-        あなたの解釈（資料そのものとは分けて書く）
-        <textarea style={S.textarea} rows={2} value={f.interpretation} onChange={set('interpretation')} maxLength={1000} />
-      </label>
-      <div style={S.barRow}>
-        <button type="submit" disabled={busy} style={{ ...S.submit, ...(busy ? S.submitOff : null) }}>
-          {busy ? '送信中…' : '資料を追加する'}
-        </button>
-        <button type="button" style={S.ghostButton} onClick={onDone}>やめる</button>
-      </div>
-    </form>
-  );
-}
-
-// ---- 有用性の評価。主張への賛否とは別のデータ (§19) ----
-
-function EvalButtons({ targetType, target, myEvals, user, act }) {
-  const mine = myEvals[`${targetType}_${target.id}`];
-  const counts = target.evalCounts || {};
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
-
-  if (target.authorId === user.uid) {
-    return (
-      <div style={S.evalRow}>
-        <span style={S.faint}>あなたが書いたものです</span>
-        <BridgeNote target={target} total={total} />
-      </div>
-    );
-  }
-
-  const toggle = (type) => act(() => (
-    mine === type
-      ? api(`/api/evaluations/${targetType}/${target.id}`, { method: 'DELETE' })
-      : api('/api/evaluations', { method: 'PUT', body: { targetType, targetId: target.id, type } })
-  ));
-
-  return (
-    <div>
-      <div style={S.evalRow}>
-        {EVAL_TYPES.map((t) => (
-          <button
-            key={t.value}
-            type="button"
-            onClick={() => toggle(t.value)}
-            style={{ ...S.evalChip, ...(mine === t.value ? S.evalChipActive : null) }}
-          >
-            {t.label}{counts[t.value] ? ` ${counts[t.value]}` : ''}
-          </button>
-        ))}
-      </div>
-      <BridgeNote target={target} total={total} />
-    </div>
-  );
-}
-
-function BridgeNote({ target, total }) {
-  if ((target.bridgeScore || 0) > 0) {
-    return <span style={S.bridgeBadge}>🌉 Bridge {target.bridgeScore}</span>;
-  }
-  if (total > 0) {
-    return (
-      <div style={S.footnote}>
-        評価 {total} 件（橋渡しの指標に使われる評価 {target.evalCount || 0}/{MIN_EVALS}）
-      </div>
-    );
-  }
-  return null;
-}
-
-// ====================================================================
-// スタイル
+// スタイル定義
 // ====================================================================
 
 const S = {
@@ -1168,57 +751,8 @@ const S = {
   segChip: { backgroundColor: THEME.paper, border: `1px solid ${THEME.rule}`, borderRadius: 4, padding: '2px 8px', fontSize: '0.8rem' },
   adoptButton: { border: '1px solid #1f4fd8', color: '#1f4fd8', background: THEME.paper, borderRadius: 6, padding: '0.3rem 0.8rem', cursor: 'pointer', fontSize: '0.85rem' },
   segColors: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginTop: '0.6rem', paddingTop: '0.6rem', borderTop: `1px solid ${THEME.rule}` },
-
-  panelEmpty: { color: THEME.muted, fontSize: '0.92rem', lineHeight: 1.8, padding: '1rem 0.5rem' },
-  quote: { margin: '0 0 0.8rem', padding: '0.4rem 0 0.4rem 0.9rem', borderLeft: '4px solid', fontFamily: THEME.serif, lineHeight: 1.9, fontSize: '1.02rem' },
-  quoteLabel: { display: 'inline-block', marginRight: 8, padding: '0 6px', borderRadius: 3, backgroundColor: THEME.ink, color: '#fff', fontFamily: THEME.sans, fontSize: '0.75rem', verticalAlign: 'middle' },
-  penRow: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', marginBottom: '1.25rem' },
   colorChip: { border: '1.5px solid', borderRadius: 14, padding: '2px 10px', cursor: 'pointer', fontSize: '0.8rem' },
 
-  block: { marginTop: '1.5rem', paddingTop: '1rem', borderTop: `1px solid ${THEME.rule}` },
-  h3: { fontSize: '0.95rem', margin: '0 0 0.7rem' },
+  panelEmpty: { color: THEME.muted, fontSize: '0.92rem', lineHeight: 1.8, padding: '1rem 0.5rem' },
   faint: { color: THEME.faint, fontSize: '0.8rem', lineHeight: 1.6 },
-  footnote: { color: THEME.faint, fontSize: '0.78rem', lineHeight: 1.6, marginTop: 4 },
-
-  sliderLabel: { fontSize: '0.9rem', fontWeight: 600, marginBottom: 4 },
-  range: { width: '100%', accentColor: THEME.ink },
-  ticks: { display: 'flex', justifyContent: 'space-between', gap: 2, marginBottom: '0.6rem' },
-  tick: { flex: 1, border: 'none', background: 'transparent', cursor: 'pointer', fontSize: '0.72rem', color: THEME.muted, padding: '4px 0', borderBottom: '2px solid transparent' },
-  tickActive: { color: THEME.ink, fontWeight: 700, borderBottomColor: THEME.ink },
-  confToggle: { display: 'block', fontSize: '0.85rem', margin: '0.4rem 0' },
-  dist: { marginTop: '0.9rem' },
-  distRow: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 4, fontSize: '0.8rem' },
-  distName: { width: 64, flexShrink: 0 },
-  distTrack: { flex: 1, height: 8, backgroundColor: '#eceef3', borderRadius: 4, overflow: 'hidden' },
-  distFill: { display: 'block', height: '100%', backgroundColor: '#7b8499' },
-  distPct: { width: 36, textAlign: 'right', color: THEME.muted },
-  history: { marginTop: '0.9rem', fontSize: '0.85rem', backgroundColor: '#f6f7fa', padding: '0.6rem 0.8rem', borderRadius: 4 },
-
-  bridgedBox: { backgroundColor: THEME.bridgeBg, padding: '0.7rem 0.8rem', borderRadius: 4, marginBottom: '0.8rem' },
-  bridgedTitle: { color: THEME.bridge, fontWeight: 700, fontSize: '0.88rem', marginBottom: 6 },
-  annotation: { borderLeft: '4px solid', padding: '0.3rem 0 0.5rem 0.75rem', marginBottom: '0.9rem' },
-  annotationHead: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: '0.85rem' },
-  annotationBody: { margin: '0.3rem 0 0.4rem', lineHeight: 1.8, fontSize: '0.92rem', whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
-  typeBadge: { border: `1px solid ${THEME.rule}`, borderRadius: 3, padding: '0 6px', fontSize: '0.72rem', color: THEME.muted },
-  bridgeBadge: { display: 'inline-block', marginTop: 4, padding: '1px 8px', borderRadius: 3, backgroundColor: THEME.bridgeBg, color: THEME.bridge, fontSize: '0.78rem', fontWeight: 700 },
-
-  evalRow: { display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' },
-  evalChip: { border: `1px solid ${THEME.rule}`, background: THEME.paper, borderRadius: 12, padding: '2px 9px', cursor: 'pointer', fontSize: '0.75rem', color: THEME.muted },
-  evalChipActive: { borderColor: THEME.ink, color: '#fff', backgroundColor: THEME.ink },
-
-  form: { marginTop: '0.9rem' },
-  typeRow: { display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 6 },
-  typeChip: { border: `1px solid ${THEME.rule}`, background: THEME.paper, borderRadius: 12, padding: '2px 10px', cursor: 'pointer', fontSize: '0.8rem', color: THEME.muted },
-  typeChipActive: { borderColor: THEME.ink, color: THEME.ink, fontWeight: 700 },
-  textarea: { width: '100%', boxSizing: 'border-box', padding: '0.6rem', border: `1px solid ${THEME.rule}`, borderRadius: 4, fontSize: '0.92rem', lineHeight: 1.7, fontFamily: 'inherit', resize: 'vertical' },
-  input: { display: 'block', width: '100%', boxSizing: 'border-box', marginTop: 4, padding: '0.5rem', border: `1px solid ${THEME.rule}`, borderRadius: 4, fontSize: '0.9rem' },
-  fieldLabel: { display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: '0.6rem' },
-  submit: { marginTop: 6, padding: '0.55rem 1.1rem', border: 'none', borderRadius: 6, backgroundColor: '#1f4fd8', color: '#fff', fontWeight: 700, cursor: 'pointer', fontSize: '0.9rem' },
-  submitOff: { backgroundColor: '#98a2b3', cursor: 'not-allowed' },
-
-  source: { padding: '0.5rem 0 0.8rem', borderBottom: `1px solid ${THEME.rule}`, marginBottom: '0.6rem' },
-  sourceTitle: { fontWeight: 700, color: '#1f4fd8', wordBreak: 'break-all' },
-  sourceLine: { fontSize: '0.85rem', lineHeight: 1.7, marginTop: 4 },
-  sourceInterp: { fontSize: '0.85rem', lineHeight: 1.7, marginTop: 4, padding: '0.4rem 0.6rem', backgroundColor: '#f6f7fa', borderRadius: 4, marginBottom: 6 },
-  addSource: { border: `1px dashed ${THEME.faint}`, background: 'transparent', borderRadius: 6, padding: '0.5rem 1rem', cursor: 'pointer', color: THEME.muted, width: '100%' },
 };
