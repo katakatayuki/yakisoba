@@ -12,7 +12,7 @@ const firebaseConfig = process.env.REACT_APP_FIREBASE_CONFIG
   ? JSON.parse(process.env.REACT_APP_FIREBASE_CONFIG)
   : {};
 
-export const SERVER_URL = process.env.REACT_APP_SERVER_URL || 'http://localhost:3000';
+export const SERVER_URL = process.env.REACT_APP_SERVER_URL || 'https://yakisoba-1.onrender.com';
 
 export const isFirebaseConfigured = Object.keys(firebaseConfig).length > 0;
 
