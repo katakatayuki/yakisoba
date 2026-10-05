@@ -1,7 +1,34 @@
 rules_version = '2';
 
+// 書き込みはすべて Render のサーバー(firebase-admin)経由で行うため、
+// クライアントからの書き込みは全面的に禁止します。
 service cloud.firestore {
   match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // ログインしていれば誰でも読める
+    match /users/{id}        { allow read: if signedIn(); allow write: if false; }
+    match /posts/{id}        { allow read: if signedIn(); allow write: if false; }
+    match /claims/{id}       { allow read: if signedIn(); allow write: if false; }
+    match /markings/{id}     { allow read: if signedIn(); allow write: if false; }
+    match /annotations/{id}  { allow read: if signedIn(); allow write: if false; }
+    match /sources/{id}      { allow read: if signedIn(); allow write: if false; }
+
+    // 主張への賛否と有用性評価は、本人だけが読める。
+    // 他の人の分布は、サーバーが claims / annotations / sources に書く集計値で見せる。
+    // (クエリには where('userId', '==', 自分のuid) を必ず付けること)
+    match /reactions/{id} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+    match /evaluations/{id} {
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
+    }
+
     match /{document=**} {
       allow read, write: if false;
     }

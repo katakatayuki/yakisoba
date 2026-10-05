@@ -1,30 +1,63 @@
-// Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-import { getAnalytics } from "firebase/analytics";
-import { getFirestore, serverTimestamp } from "firebase/firestore"; 
-import { getAuth, signInAnonymously } from "firebase/auth"; 
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
+import { getFirestore } from 'firebase/firestore';
 
-// TODO: Add SDKs for Firebase products that you want to use
-// https://firebase.google.com/docs/web/setup#available-libraries
+// ====================================================================
+// 環境変数
+//   REACT_APP_FIREBASE_CONFIG  Firebaseコンソールの設定オブジェクトをJSON文字列で
+//   REACT_APP_SERVER_URL       RenderのサーバーURL (例: https://nameraka-sns.onrender.com)
+// ====================================================================
 
-// Your web app's Firebase configuration
-// For Firebase JS SDK v7.20.0 and later, measurementId is optional
-const firebaseConfig = {
-  apiKey: "AIzaSyCb6SokAWNHqDKoBK34_QVko9WoOswMGHg",
-  authDomain: "hinodefes-57609.firebaseapp.com",
-  projectId: "hinodefes-57609",
-  storageBucket: "hinodefes-57609.firebasestorage.app",
-  messagingSenderId: "946334233570",
-  appId: "1:946334233570:web:5c7afa58394ecc55adffbb",
-  measurementId: "G-W34ZJJKZ04"
-};
+const firebaseConfig = process.env.REACT_APP_FIREBASE_CONFIG
+  ? JSON.parse(process.env.REACT_APP_FIREBASE_CONFIG)
+  : {};
 
-// Initialize Firebase
-const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
-const db = getFirestore(app);
-const auth = getAuth();
-signInAnonymously(auth).catch(() => { /* kiosk用: handle if you prefer custom auth */ });
+export const SERVER_URL = process.env.REACT_APP_SERVER_URL || 'http://localhost:3000';
 
-// ここで、db, auth, serverTimestamp をエクスポートする
-export { db, auth, serverTimestamp };
+export const isFirebaseConfigured = Object.keys(firebaseConfig).length > 0;
+
+const app = isFirebaseConfigured
+  ? (getApps().length === 0 ? initializeApp(firebaseConfig) : getApp())
+  : null;
+
+export const auth = app ? getAuth(app) : null;
+export const db = app ? getFirestore(app) : null;
+
+// ====================================================================
+// サーバーAPI呼び出し
+// ログイン中ユーザーのIDトークンを付けて送る。
+// (旧: apiSecret をクライアントに埋め込む方式は廃止)
+// ====================================================================
+
+export async function api(path, { method = 'GET', body } = {}) {
+  const user = auth && auth.currentUser;
+  if (!user) throw new Error('ログインが必要です。');
+
+  const token = await user.getIdToken();
+
+  let response;
+  try {
+    response = await fetch(`${SERVER_URL}${path}`, {
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    throw new Error('サーバーに接続できませんでした。時間をおいてもう一度お試しください。');
+  }
+
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (e) {
+    // JSON以外のレスポンスは無視
+  }
+
+  if (!response.ok) {
+    throw new Error((data && data.error) || `サーバーエラーが発生しました (${response.status})`);
+  }
+  return data;
+}
