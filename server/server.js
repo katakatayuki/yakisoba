@@ -59,6 +59,14 @@ const ANNOTATION_TYPES = ['opinion', 'question', 'counter', 'supplement', 'persp
 const EVAL_TYPES = ['useful', 'partiallyUseful', 'needsVerification', 'counterEvidence']; // §18
 const EVAL_WEIGHT = { useful: 1, partiallyUseful: 0.5, needsVerification: 0, counterEvidence: 0 };
 
+// マルジナリアへの返信 / 私的メモ / 意見の更新履歴 / 主張グラフ
+const MAX_DEPTH = 3;                // 返信の深さの上限 (クライアント src/ui.js の MAX_DEPTH と揃える)
+const MAX_NOTE = 2000;              // 私的メモの長さ
+const MAX_REASON = 200;             // 評価を変えた理由の長さ
+const MATCH_MIN_CONTAIN = 8;        // 「含む」と判定する主張の最小文字数
+const MATCH_MIN_FUZZY = 6;          // 「似ている」を判定する最小文字数
+const GRAPH_SCAN_LIMIT = 1500;      // 主張グラフで照合する主張の最大件数 (プロトタイプ用の全件走査)
+
 // 橋渡しスコア (§23)。評価が少ないものが偶然上位に来ないよう抑制する
 const MIN_EVALS = 3;                // これ未満なら橋渡しスコアは 0
 const FULL_CONFIDENCE_AT = 10;      // この件数で信頼度が 1.0 になる
@@ -180,6 +188,56 @@ function trimRange(body, start, end) {
 }
 
 // ==========================================================
+// 主張の照合 (主張グラフ用)
+//
+// 別々の投稿に書かれた「同じ主張」「主張を含む文」を、文字の一致度で探す簡易版。
+// LLM や埋め込みは使わない。表記ゆれ(全角半角・記号・空白)だけ吸収する。
+//   same     : 正規化後に一致、または文字2-gramの重なり(Jaccard)が 0.7 以上
+//   contains : 一方がもう一方を丸ごと含む (短いほうが MATCH_MIN_CONTAIN 文字以上)
+//   similar  : Jaccard が 0.5 以上
+// ==========================================================
+
+function normalizeForMatch(text) {
+    return String(text || '')
+        .normalize('NFKC')
+        .toLowerCase()
+        .replace(/[\s\p{P}\p{S}]/gu, '');
+}
+
+function bigrams(norm) {
+    const set = new Set();
+    for (let i = 0; i < norm.length - 1; i += 1) set.add(norm.slice(i, i + 2));
+    return set;
+}
+
+function matchClaims(a, b) {
+    if (!a || !b) return null;
+    if (a === b) return { kind: 'same', score: 1 };
+
+    const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+    if (short.length >= MATCH_MIN_CONTAIN && long.includes(short)) {
+        return { kind: 'contains', score: 0.9 };
+    }
+    if (short.length < MATCH_MIN_FUZZY) return null;
+
+    const ga = bigrams(a);
+    const gb = bigrams(b);
+    if (ga.size === 0 || gb.size === 0) return null;
+    let inter = 0;
+    ga.forEach((g) => { if (gb.has(g)) inter += 1; });
+    const jaccard = inter / (ga.size + gb.size - inter);
+
+    if (jaccard >= 0.7) return { kind: 'same', score: jaccard };
+    if (jaccard >= 0.5) return { kind: 'similar', score: jaccard };
+    return null;
+}
+
+function clipText(text, max) {
+    const t = String(text || '').replace(/\s+/g, ' ').trim();
+    return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
+// ==========================================================
 // 橋渡しスコア (§22, §23)
 //
 // 「反応パターン」の簡易版:
@@ -256,10 +314,12 @@ async function recomputeClaim(claimId) {
 
     const pattern = new Map();
     const reactionCounts = { '-2': 0, '-1': 0, '0': 0, '1': 0, '2': 0 };
+    let revisedCount = 0; // 評価を一度でも更新した人数 (誰がかは保存・表示しない)
     reacts.forEach(d => {
         const r = d.data();
         pattern.set(r.userId, patternOf(r.score));
         reactionCounts[String(r.score)] += 1;
+        if ((r.history || []).length > 1) revisedCount += 1;
     });
 
     const byTarget = new Map();
@@ -272,7 +332,7 @@ async function recomputeClaim(claimId) {
 
     // バッチ上限(500)に対し、1主張あたりの注釈+出典が十分少ない前提(プロトタイプ)
     const batch = db.batch();
-    batch.update(db.doc(`claims/${claimId}`), { reactionCounts, reactionTotal: reacts.size });
+    batch.update(db.doc(`claims/${claimId}`), { reactionCounts, reactionTotal: reacts.size, revisedCount });
 
     const apply = (snap, type) => snap.forEach(d => {
         const list = byTarget.get(`${type}:${d.id}`) || [];
@@ -561,6 +621,9 @@ app.post('/api/segmentations/adopt', requireAuth, limitWrite, wrap(async (req, r
 // PUT /api/claims/:claimId/reaction
 // 主張への評価 -2〜+2 と確信度(任意)。変化の履歴は本人だけが見られる (§13, §14, §25)
 // 評価の変化に「成功/失敗」の区別は付けない (§26)
+//
+// 評価を変えたときは、任意で「なぜ考えが変わったか」(note) を履歴に残せる。
+// PUT /api/claims/:claimId/reaction/note で、直近の変化に後から理由を書き足せる。
 // ==========================================================
 
 app.put('/api/claims/:claimId/reaction', requireAuth, limitWrite, wrap(async (req, res) => {
@@ -568,6 +631,7 @@ app.put('/api/claims/:claimId/reaction', requireAuth, limitWrite, wrap(async (re
     const claimId = requireId(req.params.claimId, '主張ID');
     const score = requireInt(req.body.score, '評価');
     requireOneOf(score, SCORES, '評価');
+    const note = optionalText(req.body.note, '理由', MAX_REASON);
 
     let confidence = null;
     if (req.body.confidence !== null && req.body.confidence !== undefined) {
@@ -586,7 +650,9 @@ app.put('/api/claims/:claimId/reaction', requireAuth, limitWrite, wrap(async (re
 
     let history = prev?.history || [];
     if (!prev || prev.score !== score) {
-        history = [...history, { score, at: Timestamp.now() }].slice(-100);
+        const entry = { score, at: Timestamp.now() };
+        if (note) entry.note = note;
+        history = [...history, entry].slice(-100);
     }
 
     await ref.set({
@@ -604,18 +670,53 @@ app.put('/api/claims/:claimId/reaction', requireAuth, limitWrite, wrap(async (re
     res.json({ success: true });
 }));
 
-// ==========================================================
-// POST /api/claims/:claimId/annotations  マルジナリア (§15, §16)
-// ==========================================================
-
-app.post('/api/claims/:claimId/annotations', requireAuth, limitWrite, wrap(async (req, res) => {
+app.put('/api/claims/:claimId/reaction/note', requireAuth, limitWrite, wrap(async (req, res) => {
     const uid = req.user.uid;
     const claimId = requireId(req.params.claimId, '主張ID');
-    const type = requireOneOf(req.body.type, ANNOTATION_TYPES, 'コメントの種類');
-    const body = requireText(req.body.body, 'コメント', MAX_COMMENT);
+    const note = optionalText(req.body.note, '理由', MAX_REASON);
+    const ref = db.doc(`reactions/${claimId}_${uid}`);
 
-    const claimSnap = await loadClaim(claimId);
+    await db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        const history = snap.exists ? [...(snap.data().history || [])] : [];
+        if (history.length === 0) throw new HttpError(404, 'まだこの主張に評価を入れていません。');
+
+        const last = { ...history[history.length - 1] };
+        if (note) last.note = note;
+        else delete last.note;
+        history[history.length - 1] = last;
+
+        tx.update(ref, { history, updatedAt: FieldValue.serverTimestamp() });
+    });
+
+    res.json({ success: true });
+}));
+
+// ==========================================================
+// POST /api/claims/:claimId/annotations  マルジナリア (§15, §16)
+//
+// parentId を渡すと、他の人(または自分)のマルジナリアへの返信になる。
+// 「余白への余白」は MAX_DEPTH 段まで。返信も有用性の評価(橋渡し)の対象。
+// ==========================================================
+
+async function createAnnotation({ user, claimSnap, type, body, parentId }) {
+    const uid = user.uid;
+    const claimId = claimSnap.id;
     const postId = claimSnap.data().postId;
+
+    let depth = 0;
+    let parentRef = null;
+    if (parentId) {
+        parentRef = db.doc(`annotations/${parentId}`);
+        const parentSnap = await parentRef.get();
+        if (!parentSnap.exists || parentSnap.data().claimId !== claimId) {
+            throw new HttpError(404, '返信先のマルジナリアが見つかりません。');
+        }
+        depth = (parentSnap.data().depth || 0) + 1;
+        if (depth > MAX_DEPTH) {
+            throw new HttpError(400, 'これ以上深い返信はできません。元の余白に新しく書いてください。');
+        }
+    }
 
     // 色は「その人がこの主張に引いた線の色」。賛否ではない (§12)
     const markSnap = await db.doc(`markings/${uid}_${claimId}`).get();
@@ -625,10 +726,13 @@ app.post('/api/claims/:claimId/annotations', requireAuth, limitWrite, wrap(async
         claimId,
         postId,
         authorId: uid,
-        authorName: await displayNameOf(req.user),
+        authorName: await displayNameOf(user),
         type,
         color: markSnap.exists ? markSnap.data().color : null,
         body,
+        parentId: parentId || null,
+        depth,
+        replyCount: 0,
         bridgeScore: 0,
         usefulness: 0,
         evalCount: 0,
@@ -636,10 +740,109 @@ app.post('/api/claims/:claimId/annotations', requireAuth, limitWrite, wrap(async
         createdAt: FieldValue.serverTimestamp()
     });
 
+    if (parentRef) await parentRef.update({ replyCount: FieldValue.increment(1) });
     await claimSnap.ref.update({ annotationCount: FieldValue.increment(1) });
     await touchPost(postId);
+    return ref.id;
+}
+
+app.post('/api/claims/:claimId/annotations', requireAuth, limitWrite, wrap(async (req, res) => {
+    const claimId = requireId(req.params.claimId, '主張ID');
+    const type = requireOneOf(req.body.type, ANNOTATION_TYPES, 'コメントの種類');
+    const body = requireText(req.body.body, 'コメント', MAX_COMMENT);
+    const parentId = req.body.parentId ? requireId(req.body.parentId, '返信先ID') : null;
+
+    const claimSnap = await loadClaim(claimId);
+    const id = await createAnnotation({ user: req.user, claimSnap, type, body, parentId });
+
+    res.json({ success: true, id });
+}));
+
+// ==========================================================
+// 私的マージナリア (自己対話モード)
+//
+// 本人にだけ見えるメモ。主張、または他の人のマルジナリアに付けられる。
+// 集計・橋渡しスコア・ホームの並び順には一切使わない。
+// 読み取りはクライアントが Firestore から直接行う
+// (firestore.rules で userId が本人のものだけ許可すること)。
+//
+// POST   /api/private-notes              メモを書く
+// PUT    /api/private-notes/:id          メモを直す
+// DELETE /api/private-notes/:id          メモを消す
+// POST   /api/private-notes/:id/publish  メモを余白(マルジナリア)として公開する
+// ==========================================================
+
+const NOTE_TARGETS = ['claim', 'annotation'];
+
+async function loadOwnNote(req) {
+    const id = requireId(req.params.id, 'メモID');
+    const ref = db.doc(`privateNotes/${id}`);
+    const snap = await ref.get();
+    // 他人のメモは「存在しない」と同じ扱いにする
+    if (!snap.exists || snap.data().userId !== req.user.uid) {
+        throw new HttpError(404, 'メモが見つかりません。');
+    }
+    return { ref, note: snap.data() };
+}
+
+app.post('/api/private-notes', requireAuth, limitWrite, wrap(async (req, res) => {
+    const uid = req.user.uid;
+    const claimId = requireId(req.body.claimId, '主張ID');
+    const targetType = requireOneOf(req.body.targetType || 'claim', NOTE_TARGETS, '対象の種類');
+    const body = requireText(req.body.body, 'メモ', MAX_NOTE);
+
+    const claimSnap = await loadClaim(claimId);
+
+    let targetId = null;
+    if (targetType === 'annotation') {
+        targetId = requireId(req.body.targetId, '対象ID');
+        const target = await db.doc(`annotations/${targetId}`).get();
+        if (!target.exists || target.data().claimId !== claimId) {
+            throw new HttpError(404, 'メモを付ける対象が見つかりません。');
+        }
+    }
+
+    const ref = db.collection('privateNotes').doc();
+    await ref.set({
+        userId: uid,
+        claimId,
+        postId: claimSnap.data().postId,
+        targetType,
+        targetId,
+        body,
+        publishedAnnotationId: null,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp()
+    });
 
     res.json({ success: true, id: ref.id });
+}));
+
+app.put('/api/private-notes/:id', requireAuth, limitWrite, wrap(async (req, res) => {
+    const { ref } = await loadOwnNote(req);
+    const body = requireText(req.body.body, 'メモ', MAX_NOTE);
+    await ref.update({ body, updatedAt: FieldValue.serverTimestamp() });
+    res.json({ success: true });
+}));
+
+app.delete('/api/private-notes/:id', requireAuth, limitWrite, wrap(async (req, res) => {
+    const { ref } = await loadOwnNote(req);
+    await ref.delete();
+    res.json({ success: true });
+}));
+
+app.post('/api/private-notes/:id/publish', requireAuth, limitWrite, wrap(async (req, res) => {
+    const { ref, note } = await loadOwnNote(req);
+    const type = requireOneOf(req.body.type || 'opinion', ANNOTATION_TYPES, 'コメントの種類');
+    if (note.publishedAnnotationId) throw new HttpError(400, 'このメモはすでに公開しています。');
+
+    const claimSnap = await loadClaim(note.claimId);
+    const parentId = note.targetType === 'annotation' ? note.targetId : null;
+    const id = await createAnnotation({ user: req.user, claimSnap, type, body: note.body, parentId });
+
+    // メモ自体は残す(自己対話の記録として)。公開済みの印だけ付ける
+    await ref.update({ publishedAnnotationId: id, updatedAt: FieldValue.serverTimestamp() });
+    res.json({ success: true, id });
 }));
 
 // ==========================================================
@@ -682,6 +885,114 @@ app.post('/api/claims/:claimId/sources', requireAuth, limitWrite, wrap(async (re
     await touchPost(postId);
 
     res.json({ success: true, id: ref.id });
+}));
+
+// ==========================================================
+// GET /api/claims/:claimId/graph  主張グラフ
+//
+// 1つの主張を中心に、次の3つをつなげて返す。
+//   related  : 別の投稿に書かれた「同じ / 含む / 似ている」主張
+//   sources  : この主張(と、その同じ主張)を支える出典。「反証あり」の評価数つき
+//   counters : この主張(と、その同じ主張)への「反論」マルジナリア
+// 非公開の投稿の主張は含めない。
+// ==========================================================
+
+const limitGraph = rateLimit(20, 60 * 1000);
+
+app.get('/api/claims/:claimId/graph', requireAuth, limitGraph, wrap(async (req, res) => {
+    const claimId = requireId(req.params.claimId, '主張ID');
+    const centerSnap = await loadClaim(claimId);
+    const center = centerSnap.data();
+    const centerNorm = normalizeForMatch(center.text);
+
+    // 1. 他の投稿の、同じ・含む・似た主張を探す (プロトタイプ: 直近の主張を全件走査)
+    const scan = await db.collection('claims')
+        .orderBy('createdAt', 'desc')
+        .limit(GRAPH_SCAN_LIMIT)
+        .get();
+
+    const matched = [];
+    scan.forEach((d) => {
+        if (d.id === claimId) return;
+        const c = d.data();
+        if (c.postId === center.postId) return;
+        if ((c.usageCount || 0) <= 0) return;
+        const m = matchClaims(centerNorm, normalizeForMatch(c.text));
+        if (m) matched.push({ id: d.id, c, kind: m.kind, score: m.score });
+    });
+    matched.sort((x, y) => y.score - x.score);
+    const top = matched.slice(0, 12);
+
+    const postIds = [...new Set(top.map((t) => t.c.postId))];
+    const postSnaps = await Promise.all(postIds.map((id) => db.doc(`posts/${id}`).get()));
+    const posts = new Map();
+    postSnaps.forEach((p) => {
+        if (p.exists && p.data().visibility === 'public') posts.set(p.id, p.data());
+    });
+
+    const related = top
+        .filter((t) => posts.has(t.c.postId))
+        .map((t) => ({
+            id: t.id,
+            postId: t.c.postId,
+            postTitle: posts.get(t.c.postId).title,
+            text: clipText(t.c.text, 160),
+            kind: t.kind,
+            score: Math.round(t.score * 100) / 100,
+            usageCount: t.c.usageCount || 0,
+            reactionTotal: t.c.reactionTotal || 0,
+            reactionCounts: t.c.reactionCounts || {}
+        }));
+
+    // 2. 出典と反論 (この主張 + 同じ主張にぶら下がるもの)
+    const ids = [claimId, ...related.map((r) => r.id)];
+    const [srcSnap, annSnap] = await Promise.all([
+        db.collection('sources').where('claimId', 'in', ids).get(),
+        db.collection('annotations').where('claimId', 'in', ids).get()
+    ]);
+
+    const sources = srcSnap.docs
+        .map((d) => {
+            const x = d.data();
+            const counts = x.evalCounts || {};
+            return {
+                id: d.id,
+                claimId: x.claimId,
+                postId: x.postId,
+                title: x.title,
+                url: x.url,
+                authorName: x.authorName || 'ななしさん',
+                evidenceLocation: x.evidenceLocation || '',
+                bridgeScore: x.bridgeScore || 0,
+                evalCount: x.evalCount || 0,
+                useful: (counts.useful || 0) + (counts.partiallyUseful || 0),
+                counterEvidence: counts.counterEvidence || 0
+            };
+        })
+        .sort((x, y) => y.bridgeScore - x.bridgeScore || y.useful - x.useful)
+        .slice(0, 20);
+
+    const counters = annSnap.docs
+        .map((d) => ({ id: d.id, ...d.data() }))
+        .filter((x) => x.type === 'counter')
+        .map((x) => ({
+            id: x.id,
+            claimId: x.claimId,
+            postId: x.postId,
+            authorName: x.authorName || 'ななしさん',
+            body: clipText(x.body, 140),
+            bridgeScore: x.bridgeScore || 0
+        }))
+        .sort((x, y) => y.bridgeScore - x.bridgeScore)
+        .slice(0, 12);
+
+    res.json({
+        claim: { id: claimId, postId: center.postId, text: clipText(center.text, 160) },
+        related,
+        sources,
+        counters,
+        truncated: scan.size >= GRAPH_SCAN_LIMIT
+    });
 }));
 
 // ==========================================================
@@ -778,4 +1089,7 @@ if (require.main === module) {
 }
 
 // テスト用に純粋関数を公開
-module.exports = { app, iou, trimRange, computeBridge, normalizedEntropy, patternOf };
+module.exports = {
+    app, iou, trimRange, computeBridge, normalizedEntropy, patternOf,
+    normalizeForMatch, matchClaims
+};

@@ -234,3 +234,47 @@ export function computePatterns(claims, markings) {
 
   return { total, list };
 }
+
+// ====================================================================
+// 追加: マルジナリアの返信スレッド / 時間表示 / アバター色
+// ====================================================================
+
+// 平らな注釈の配列を、parentId でつないだ木にする。
+// 返信先が見つからないもの(削除など)は、いちばん上の階層に出す。
+export function buildThread(annotations) {
+  const nodes = new Map(annotations.map((a) => [a.id, { ...a, children: [] }]));
+  const roots = [];
+  nodes.forEach((node) => {
+    const parent = node.parentId ? nodes.get(node.parentId) : null;
+    if (parent) parent.children.push(node);
+    else roots.push(node);
+  });
+  const byTime = (a, b) => toMillis(a.createdAt) - toMillis(b.createdAt);
+  const sortAll = (list) => {
+    list.sort(byTime);
+    list.forEach((n) => sortAll(n.children));
+  };
+  sortAll(roots);
+  return roots;
+}
+
+// 「3分前」「2日前」のような相対表示。1週間を超えたら日付にする
+export function timeAgo(ts, now = Date.now()) {
+  const ms = toMillis(ts);
+  if (!ms) return '';
+  const minutes = Math.floor(Math.max(0, now - ms) / 60000);
+  if (minutes < 1) return 'たった今';
+  if (minutes < 60) return `${minutes}分前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}時間前`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}日前`;
+  return formatDate(ts);
+}
+
+// 名前から決まる、やわらかいアバター色
+export function avatarColors(name) {
+  let hue = 0;
+  for (const ch of String(name || '')) hue = (hue * 31 + ch.codePointAt(0)) % 360;
+  return { bg: `hsl(${hue}, 55%, 90%)`, fg: `hsl(${hue}, 45%, 30%)` };
+}
