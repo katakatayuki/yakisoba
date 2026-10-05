@@ -43,8 +43,17 @@ const M = {
 // 余白の一覧(入れ子)
 // ====================================================================
 
-export default function Marginalia({ claim, annotations, notes, myEvals, myColor, hasReaction, user, act }) {
-  const roots = useMemo(() => buildThread(annotations), [annotations]);
+export default function Marginalia({
+  claim, annotations, notes, myEvals, myColor, hasReaction, user, act,
+  ownOnly = false, showComposer = true,
+}) {
+  // 自分で書く場では、自分の余白だけを見せる。ほかの反応は
+  // 「みんなのこえ」を明示して開いた時だけ読めるようにする。
+  const displayedAnnotations = useMemo(
+    () => (ownOnly ? annotations.filter((annotation) => annotation.authorId === user.uid) : annotations),
+    [annotations, ownOnly, user.uid]
+  );
+  const roots = useMemo(() => buildThread(displayedAnnotations), [displayedAnnotations]);
 
   const notesByTarget = useMemo(() => {
     const map = {};
@@ -68,8 +77,8 @@ export default function Marginalia({ claim, annotations, notes, myEvals, myColor
 
   return (
     <div>
-      {annotations.length === 0 && (
-        <div style={U.faint}>まだ余白への書き込みはありません。最初の一言を書いてみましょう。</div>
+      {displayedAnnotations.length === 0 && (
+        <div style={U.faint}>{ownOnly ? 'まだあなたの余白はありません。最初の一言を書いてみましょう。' : 'まだ余白への書き込みはありません。最初の一言を書いてみましょう。'}</div>
       )}
 
       {bridged.length > 0 && (
@@ -81,16 +90,18 @@ export default function Marginalia({ claim, annotations, notes, myEvals, myColor
 
       {rest.map((n) => <AnnotationNode key={n.id} node={n} depth={0} ctx={ctx} />)}
 
-      {!hasReaction && annotations.length > 0 && (
+      {!ownOnly && !hasReaction && displayedAnnotations.length > 0 && (
         <div style={U.footnote}>
-          橋渡しの指標に反映されるのは、この主張に自分の評価（「評価」タブ）を入れた人の「有用」評価です。
+          橋渡しの指標に反映されるのは、この主張に自分の評価を入れた人の「有用」評価です。
         </div>
       )}
 
-      <div style={M.formWrap}>
-        <div style={M.formTitle}>余白に書く</div>
-        <AnnotationForm claim={claim} myColor={myColor} act={act} placeholder="この主張について、考えたこと・疑問・根拠など" />
-      </div>
+      {showComposer && (
+        <div style={M.formWrap}>
+          <div style={M.formTitle}>余白に書く</div>
+          <AnnotationForm claim={claim} myColor={myColor} act={act} placeholder="この主張について、考えたこと・疑問・根拠など" />
+        </div>
+      )}
     </div>
   );
 }

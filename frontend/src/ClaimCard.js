@@ -1,10 +1,9 @@
 import React, { useEffect, useState } from 'react';
 
 import { api } from './firebase';
-import { THEME, PEN, PEN_KEYS, SCORES, signed, toMillis, formatDate } from './lib';
+import { THEME, PEN, PEN_KEYS, SCORES, signed, toMillis } from './lib';
 import { U, MiniBar, EvalButtons, SCORE_COLOR, ACCENT } from './ui';
 import Marginalia, { PrivateNotesTab } from './Marginalia';
-import ClaimGraph from './ClaimGraph';
 
 // ====================================================================
 // 主張カード
@@ -55,6 +54,7 @@ const C = {
   scoreBtn: { flex: 1, padding: '10px 2px', border: `1.5px solid ${THEME.rule}`, borderRadius: 10, background: THEME.paper, cursor: 'pointer', fontSize: '0.78rem', color: THEME.muted, fontFamily: 'inherit', lineHeight: 1.3 },
   scoreCurrent: { fontSize: '0.92rem', fontWeight: 700, margin: '0 0 8px' },
   dist: { marginTop: 14 },
+  voiceLead: { color: THEME.ink, fontSize: '0.9rem', fontWeight: 700, marginBottom: 8 },
   distRow: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 4, fontSize: '0.78rem' },
   distName: { width: 64, flexShrink: 0 },
   distTrack: { flex: 1, height: 8, backgroundColor: '#eceef3', borderRadius: 4, overflow: 'hidden' },
@@ -76,21 +76,39 @@ const C = {
   sourceInterp: { fontSize: '0.85rem', lineHeight: 1.7, marginTop: 4, padding: '0.4rem 0.6rem', backgroundColor: '#f6f7fa', borderRadius: 8 },
   addSource: { border: `1px dashed ${THEME.faint}`, background: 'transparent', borderRadius: 12, padding: '0.6rem 1rem', cursor: 'pointer', color: THEME.muted, width: '100%', fontFamily: 'inherit' },
   buttons: { display: 'flex', gap: 8, marginTop: 6 },
-};
 
-const TABS = [
-  { key: 'react', label: '評価' },
-  { key: 'margin', label: '余白' },
-  { key: 'source', label: '出典' },
-  { key: 'graph', label: 'つながり' },
-  { key: 'memo', label: '🔒メモ' },
-];
+  actionButton: { display: 'flex', width: '100%', alignItems: 'center', gap: 10, textAlign: 'left', padding: '0.8rem 0.85rem', marginTop: 16, border: `1px solid #b8c9ff`, borderRadius: 12, backgroundColor: '#f6f8ff', color: THEME.ink, cursor: 'pointer', fontFamily: 'inherit' },
+  actionButtonOpen: { borderColor: '#1f4fd8', backgroundColor: '#eef3ff' },
+  actionIcon: { width: 29, height: 29, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: '50%', backgroundColor: '#dbe6ff', color: '#1f4fd8', fontWeight: 700, flexShrink: 0 },
+  actionArrow: { marginLeft: 'auto', fontSize: '1.2rem', color: '#1f4fd8' },
+  writerPanel: { marginTop: 10, padding: '0.8rem', border: `1px solid ${THEME.rule}`, borderRadius: 12, backgroundColor: '#fcfdff' },
+  sourceInMargin: { marginTop: 14, paddingTop: 12, borderTop: `1px solid ${THEME.rule}` },
+  insetTitle: { color: THEME.ink, fontSize: '0.87rem', fontWeight: 700, marginBottom: 5 },
+  moreActions: { display: 'grid', gap: 7, marginTop: 12 },
+  secondaryAction: { display: 'grid', gridTemplateColumns: '1fr auto', columnGap: 8, textAlign: 'left', alignItems: 'center', padding: '0.65rem 0.7rem', border: `1px solid ${THEME.rule}`, borderRadius: 10, backgroundColor: '#fff', color: THEME.ink, cursor: 'pointer', fontFamily: 'inherit', fontSize: '0.86rem' },
+  secondaryActionOpen: { backgroundColor: '#f6f8fc', borderColor: '#aeb8cc' },
+  secondaryText: { display: 'grid', gap: 2 },
+  communityPanel: { marginTop: 10, padding: '0.85rem', border: `1px solid ${THEME.rule}`, borderRadius: 12, backgroundColor: '#fff' },
+  memoPanel: { marginTop: 10, padding: '0.85rem', border: `1px solid ${THEME.rule}`, borderRadius: 12, backgroundColor: '#fafaf6' },
+  panelTitle: { margin: '0 0 2px', fontSize: '1rem', fontFamily: THEME.serif },
+  communitySection: { marginTop: 16, paddingTop: 14, borderTop: `1px solid ${THEME.rule}` },
+};
 
 export default function ClaimCard({
   claim, label, expanded, onToggle, user, myColor, myReaction, myEvals,
   annotations, sources, notes, notesReady, act,
 }) {
-  const [tab, setTab] = useState('react');
+  const [writing, setWriting] = useState(false);
+  const [communityOpen, setCommunityOpen] = useState(false);
+  const [memoOpen, setMemoOpen] = useState(false);
+
+  useEffect(() => {
+    if (!expanded) {
+      setWriting(false);
+      setCommunityOpen(false);
+      setMemoOpen(false);
+    }
+  }, [expanded]);
 
   const changeColor = (color) => act(() => api(`/api/markings/${claim.id}`, { method: 'PUT', body: { color } }));
   const removeMark = () => act(() => api(`/api/markings/${claim.id}`, { method: 'DELETE' }), '線を消しました。');
@@ -101,8 +119,6 @@ export default function ClaimCard({
     }),
     'この主張に線を引きました。'
   );
-
-  const counts = { margin: annotations.length, source: sources.length, memo: notes.length };
 
   return (
     <article id={`claim-${claim.id}`} style={{ ...C.card, ...(expanded ? C.cardOpen : null) }}>
@@ -120,13 +136,15 @@ export default function ClaimCard({
         <span style={{ ...C.quote, ...(expanded ? null : C.quoteClamp) }}>{claim.text}</span>
       </button>
 
-      <div style={C.meta}>
-        <MiniBar counts={claim.reactionCounts} total={claim.reactionTotal || 0} />
-        <div style={C.stats}>
-          線 {Math.max(0, claim.usageCount || 0)}　評価 {claim.reactionTotal || 0}　余白 {claim.annotationCount || 0}　出典 {claim.sourceCount || 0}
-          {(claim.revisedCount || 0) > 0 && <span style={C.revisedTag}>考えを更新した人 {claim.revisedCount}</span>}
+      {!expanded && (
+        <div style={C.meta}>
+          <MiniBar counts={claim.reactionCounts} total={claim.reactionTotal || 0} />
+          <div style={C.stats}>
+            線 {Math.max(0, claim.usageCount || 0)}　評価 {claim.reactionTotal || 0}　余白 {claim.annotationCount || 0}　出典 {claim.sourceCount || 0}
+            {(claim.revisedCount || 0) > 0 && <span style={C.revisedTag}>考えを更新した人 {claim.revisedCount}</span>}
+          </div>
         </div>
-      </div>
+      )}
 
       {expanded && (
         <div style={C.body}>
@@ -151,40 +169,75 @@ export default function ClaimCard({
             {myColor && <button type="button" style={U.linkBtn} onClick={removeMark}>線を消す</button>}
           </div>
 
-          <div style={C.tabs} role="tablist">
-            {TABS.map((t) => (
-              <button
-                key={t.key}
-                type="button"
-                role="tab"
-                aria-selected={tab === t.key}
-                onClick={() => setTab(t.key)}
-                style={{ ...C.tab, ...(tab === t.key ? C.tabActive : null) }}
-              >
-                {t.label}
-                {counts[t.key] > 0 && <span style={C.count}>{counts[t.key]}</span>}
-              </button>
-            ))}
+          <ReactionBox claim={claim} myReaction={myReaction} act={act} mode="personal" />
+
+          <button type="button" style={{ ...C.actionButton, ...(writing ? C.actionButtonOpen : null) }} onClick={() => setWriting((value) => !value)}>
+            <span style={C.actionIcon}>✎</span>
+            <span><b>余白に書く</b><small>この主張を読んで、自分が考えたことを残す</small></span>
+            <span style={C.actionArrow}>{writing ? '−' : '＋'}</span>
+          </button>
+
+          {writing && (
+            <div style={C.writerPanel}>
+              <Marginalia
+                claim={claim}
+                annotations={annotations}
+                notes={notes}
+                myEvals={myEvals}
+                myColor={myColor}
+                hasReaction={!!myReaction}
+                user={user}
+                act={act}
+                ownOnly
+              />
+              <div style={C.sourceInMargin}>
+                <div style={C.insetTitle}>出典を添える</div>
+                <div style={U.faint}>この余白の背景にある資料やデータを、必要なときだけ追加できます。</div>
+                <SourcesBox claim={claim} sources={sources} myEvals={myEvals} user={user} act={act} />
+              </div>
+            </div>
+          )}
+
+          <div style={C.moreActions}>
+            <button type="button" style={{ ...C.secondaryAction, ...(communityOpen ? C.secondaryActionOpen : null) }} onClick={() => setCommunityOpen((value) => !value)}>
+              <span style={C.secondaryText}><b>みんなのこえ</b><small>評価 {claim.reactionTotal || 0} ・余白 {annotations.length} ・出典 {sources.length}</small></span><b>{communityOpen ? '⌃' : '⌄'}</b>
+            </button>
+            <button type="button" style={{ ...C.secondaryAction, ...(memoOpen ? C.secondaryActionOpen : null) }} onClick={() => setMemoOpen((value) => !value)}>
+              <span style={C.secondaryText}><b>🔒 自分用のメモ</b><small>{notes.length ? `${notes.length}件のメモ` : '自分だけに見える'}</small></span><b>{memoOpen ? '⌃' : '⌄'}</b>
+            </button>
           </div>
 
-          {tab === 'react' && <ReactionBox claim={claim} myReaction={myReaction} act={act} />}
-          {tab === 'margin' && (
-            <Marginalia
-              claim={claim}
-              annotations={annotations}
-              notes={notes}
-              myEvals={myEvals}
-              myColor={myColor}
-              hasReaction={!!myReaction}
-              user={user}
-              act={act}
-            />
+          {communityOpen && (
+            <section style={C.communityPanel}>
+              <h3 style={C.panelTitle}>みんなのこえ</h3>
+              <ReactionBox claim={claim} myReaction={myReaction} act={act} mode="community" />
+              <div style={C.communitySection}>
+                <div style={C.insetTitle}>みんなの余白</div>
+                <Marginalia
+                  claim={claim}
+                  annotations={annotations}
+                  notes={notes}
+                  myEvals={myEvals}
+                  myColor={myColor}
+                  hasReaction={!!myReaction}
+                  user={user}
+                  act={act}
+                  showComposer={false}
+                />
+              </div>
+              <div style={C.communitySection}>
+                <div style={C.insetTitle}>余白に添えられた出典</div>
+                <SourcesBox claim={claim} sources={sources} myEvals={myEvals} user={user} act={act} allowAdd={false} />
+              </div>
+            </section>
           )}
-          {tab === 'source' && <SourcesBox claim={claim} sources={sources} myEvals={myEvals} user={user} act={act} />}
-          {tab === 'graph' && <ClaimGraph claim={claim} />}
-          {tab === 'memo' && (
-            <PrivateNotesTab claim={claim} notes={notes} annotations={annotations} notesReady={notesReady} act={act} />
+
+          {memoOpen && (
+            <section style={C.memoPanel}>
+              <PrivateNotesTab claim={claim} notes={notes} annotations={annotations} notesReady={notesReady} act={act} />
+            </section>
           )}
+
         </div>
       )}
     </article>
@@ -197,35 +250,43 @@ export default function ClaimCard({
 //   どちらへ動いたか(賛成→反対 など)に、良い悪いの区別は付けない。
 // ====================================================================
 
-function ReactionBox({ claim, myReaction, act }) {
+function ReactionBox({ claim, myReaction, act, mode = 'personal' }) {
   const saved = myReaction ? myReaction.score : undefined;
   const savedConf = myReaction && myReaction.confidence !== undefined ? myReaction.confidence : null;
-
-  const [useConf, setUseConf] = useState(savedConf !== null);
-  const [conf, setConf] = useState(savedConf !== null ? savedConf : 50);
-
-  useEffect(() => {
-    setUseConf(savedConf !== null);
-    setConf(savedConf !== null ? savedConf : 50);
-  }, [claim.id, savedConf]);
 
   const commit = (score, confidence) => {
     if (score === saved && confidence === savedConf) return;
     act(() => api(`/api/claims/${claim.id}/reaction`, { method: 'PUT', body: { score, confidence } }));
   };
 
-  const pick = (value) => commit(value, useConf ? conf : null);
-
-  const toggleConf = (on) => {
-    setUseConf(on);
-    if (!on && saved !== undefined) commit(saved, null);
-  };
-
   const dist = claim.reactionCounts || {};
   const total = claim.reactionTotal || 0;
   const current = SCORES.find((s) => s.value === saved);
   const ticks = [...SCORES].reverse(); // 左が反対、右が賛成
-  const history = (myReaction && myReaction.history) || [];
+
+  if (mode === 'community') {
+    return (
+      <div style={C.dist}>
+        <div style={C.voiceLead}>みんなの評価（{total} 人）</div>
+        {SCORES.map((s) => {
+          const n = dist[String(s.value)] || 0;
+          const pct = total ? Math.round((n / total) * 100) : 0;
+          return (
+            <div key={s.value} style={C.distRow}>
+              <span style={C.distName}>{s.short}{saved === s.value ? ' ●' : ''}</span>
+              <span style={C.distTrack}>
+                <span style={{ display: 'block', height: '100%', width: `${pct}%`, backgroundColor: SCORE_COLOR[String(s.value)] }} />
+              </span>
+              <span style={C.distPct}>{pct}%</span>
+            </div>
+          );
+        })}
+        {(claim.revisedCount || 0) > 0 && (
+          <div style={{ ...U.faint, marginTop: 8 }}>この主張では、{claim.revisedCount} 人が読んで考えを更新しています。</div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -241,7 +302,7 @@ function ReactionBox({ claim, myReaction, act }) {
               key={s.value}
               type="button"
               aria-pressed={active}
-              onClick={() => pick(s.value)}
+              onClick={() => commit(s.value, savedConf)}
               style={{
                 ...C.scoreBtn,
                 borderColor: active ? SCORE_COLOR[String(s.value)] : THEME.rule,
@@ -256,138 +317,6 @@ function ReactionBox({ claim, myReaction, act }) {
         })}
       </div>
 
-      {saved !== undefined && (
-        <>
-          <label style={{ display: 'block', fontSize: '0.85rem', margin: '12px 0 4px' }}>
-            <input type="checkbox" checked={useConf} onChange={(e) => toggleConf(e.target.checked)} />
-            {' '}確信度も記録する
-          </label>
-          {useConf && (
-            <div>
-              <div style={{ fontSize: '0.85rem', fontWeight: 600 }}>この判断への自信 {conf}%</div>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                step={1}
-                value={conf}
-                aria-label="確信度"
-                onChange={(e) => setConf(Number(e.target.value))}
-                onPointerUp={(e) => commit(saved, Number(e.currentTarget.value))}
-                onKeyUp={(e) => commit(saved, Number(e.currentTarget.value))}
-                style={{ width: '100%', accentColor: THEME.ink }}
-              />
-            </div>
-          )}
-        </>
-      )}
-
-      <div style={C.dist}>
-        <div style={U.faint}>みんなの評価（{total} 人）</div>
-        {SCORES.map((s) => {
-          const n = dist[String(s.value)] || 0;
-          const pct = total ? Math.round((n / total) * 100) : 0;
-          return (
-            <div key={s.value} style={C.distRow}>
-              <span style={C.distName}>{s.short}{saved === s.value ? ' ●' : ''}</span>
-              <span style={C.distTrack}>
-                <span style={{ display: 'block', height: '100%', width: `${pct}%`, backgroundColor: SCORE_COLOR[String(s.value)] }} />
-              </span>
-              <span style={C.distPct}>{pct}%</span>
-            </div>
-          );
-        })}
-        {(claim.revisedCount || 0) > 0 && (
-          <div style={{ ...U.faint, marginTop: 8 }}>
-            この主張では、{claim.revisedCount} 人が読んで考えを更新しています。
-          </div>
-        )}
-      </div>
-
-      {history.length > 0 && <Trajectory claim={claim} history={history} act={act} />}
-    </div>
-  );
-}
-
-// ---- 考えの軌跡(本人にだけ見える) ----
-
-function Trajectory({ claim, history, act }) {
-  const revisions = history.length - 1;
-  const lastIndex = history.length - 1;
-  const last = history[lastIndex];
-
-  const [editing, setEditing] = useState(false);
-  const [note, setNote] = useState(last.note || '');
-
-  // 評価が変わって最新の履歴が入れ替わったら、入力欄も新しくする
-  useEffect(() => {
-    setNote(last.note || '');
-    setEditing(false);
-  }, [history.length, last.note]);
-
-  const saveNote = async () => {
-    const result = await act(
-      () => api(`/api/claims/${claim.id}/reaction/note`, { method: 'PUT', body: { note: note.trim() } }),
-      '理由を残しました。'
-    );
-    if (result) setEditing(false);
-  };
-
-  return (
-    <div style={C.traj}>
-      <div style={C.trajTitle}>
-        あなたの考えの軌跡
-        {revisions > 0 && <span style={C.revisedTag}>考えを {revisions} 回更新</span>}
-      </div>
-      <div style={{ ...U.faint, marginBottom: 12 }}>
-        {revisions > 0
-          ? '読み、考え続けたからこそ起きた変化です。この記録はあなたにだけ見えます。'
-          : 'あとで考えが変わったら、ここに積み重なっていきます。この記録はあなたにだけ見えます。'}
-      </div>
-
-      {history.map((h, i) => {
-        const s = SCORES.find((x) => x.value === h.score);
-        const isLast = i === lastIndex;
-        return (
-          <div key={`${toMillis(h.at)}-${i}`} style={{ ...C.step, paddingBottom: isLast ? 0 : 12 }}>
-            <div style={C.rail}>
-              <span style={{ ...C.dot, backgroundColor: SCORE_COLOR[String(h.score)] }} />
-              {!isLast && <span style={C.line} />}
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={C.stepHead}>
-                {s ? s.label : signed(h.score)}（{signed(h.score)}）
-                <span style={{ ...U.faint, marginLeft: 8, fontWeight: 400 }}>
-                  {i === 0 ? '最初の評価' : '考えを更新'}　{formatDate(h.at)}
-                </span>
-              </div>
-
-              {h.note && !(isLast && editing) && <div style={C.stepNote}>「{h.note}」</div>}
-
-              {isLast && (editing ? (
-                <div style={{ marginTop: 6 }}>
-                  <textarea
-                    style={U.textarea}
-                    rows={2}
-                    maxLength={200}
-                    value={note}
-                    onChange={(e) => setNote(e.target.value)}
-                    placeholder={i === 0 ? 'なぜこの評価にしましたか？(任意)' : 'なぜ考えが変わりましたか？(任意)'}
-                  />
-                  <div style={C.buttons}>
-                    <button type="button" style={U.submit} onClick={saveNote}>残す</button>
-                    <button type="button" style={U.ghost} onClick={() => { setEditing(false); setNote(last.note || ''); }}>やめる</button>
-                  </div>
-                </div>
-              ) : (
-                <button type="button" style={{ ...U.linkBtn, marginLeft: -6 }} onClick={() => setEditing(true)}>
-                  {last.note ? '理由を直す' : i === 0 ? '理由を書き残す' : 'なぜ変わったかを書き残す'}
-                </button>
-              ))}
-            </div>
-          </div>
-        );
-      })}
     </div>
   );
 }
@@ -396,7 +325,7 @@ function Trajectory({ claim, history, act }) {
 // 出典 (§17, §18, §36)
 // ====================================================================
 
-function SourcesBox({ claim, sources, myEvals, user, act }) {
+function SourcesBox({ claim, sources, myEvals, user, act, allowAdd = true }) {
   const [open, setOpen] = useState(false);
   const sorted = [...sources].sort((a, b) => (b.bridgeScore || 0) - (a.bridgeScore || 0)
     || toMillis(a.createdAt) - toMillis(b.createdAt));
@@ -416,11 +345,9 @@ function SourcesBox({ claim, sources, myEvals, user, act }) {
         </div>
       ))}
 
-      {open ? (
+      {allowAdd && open ? (
         <SourceForm claim={claim} act={act} onDone={() => setOpen(false)} />
-      ) : (
-        <button type="button" style={C.addSource} onClick={() => setOpen(true)}>＋ 資料を追加する</button>
-      )}
+      ) : allowAdd ? <button type="button" style={C.addSource} onClick={() => setOpen(true)}>＋ 出典を追加する</button> : null}
     </div>
   );
 }
