@@ -238,11 +238,12 @@ export default function App() {
   return (
     <div style={S.app}>
       <header style={S.header}>
-        <a href="#/" style={S.headerBrand}>なめらかなSNS</a>
+        <a href="#/" style={S.headerBrand}><span style={S.brandMark}>n</span><span>なめらかなSNS</span></a>
         <nav style={S.nav}>
-          <a href="#/new" style={S.navLink}>投稿する</a>
+          <a href="#/" style={S.navLink}>ホーム</a>
+          <a href="#/new" style={S.postLink}>＋ 投稿する</a>
           <AccountSwitcher user={user} />
-          <span style={S.who}>{user.displayName || user.email}</span>
+          <span style={S.userPill}><span style={S.userInitial}>{Array.from(user.displayName || user.email || 'な')[0]}</span><span style={S.who}>{user.displayName || user.email}</span></span>
           <button type="button" style={S.logout} onClick={() => signOut(auth)}>ログアウト</button>
         </nav>
       </header>
@@ -265,15 +266,20 @@ const S = {
     justifyContent: 'space-between',
     flexWrap: 'wrap',
     gap: '0.5rem',
-    padding: '0.75rem 1.25rem',
-    backgroundColor: THEME.paper,
+    padding: '0.7rem max(1rem, calc((100vw - 1120px) / 2))',
+    backgroundColor: 'rgba(255,255,255,0.92)',
     borderBottom: `1px solid ${THEME.rule}`,
+    position: 'sticky', top: 0, zIndex: 40, backdropFilter: 'blur(12px)',
   },
-  headerBrand: { fontFamily: THEME.serif, fontWeight: 700, fontSize: '1.15rem', color: THEME.ink, textDecoration: 'none' },
-  nav: { display: 'flex', alignItems: 'center', gap: '1rem', flexWrap: 'wrap' },
-  navLink: { color: '#1f4fd8', fontWeight: 600, textDecoration: 'none' },
-  who: { color: THEME.muted, fontSize: '0.9rem' },
-  logout: { border: `1px solid ${THEME.rule}`, background: 'transparent', borderRadius: 6, padding: '0.3rem 0.7rem', cursor: 'pointer', color: THEME.muted },
+  headerBrand: { display: 'inline-flex', alignItems: 'center', gap: 8, fontFamily: THEME.serif, fontWeight: 700, fontSize: '1.1rem', color: THEME.ink, textDecoration: 'none', letterSpacing: '0.02em' },
+  brandMark: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: 9, backgroundColor: '#1f4fd8', color: '#fff', fontFamily: THEME.sans, fontWeight: 800, fontSize: '1rem' },
+  nav: { display: 'flex', alignItems: 'center', gap: '0.65rem', flexWrap: 'wrap' },
+  navLink: { color: THEME.muted, fontWeight: 600, textDecoration: 'none', fontSize: '0.88rem', padding: '0.4rem 0.5rem' },
+  postLink: { color: '#fff', backgroundColor: '#1f4fd8', fontWeight: 700, textDecoration: 'none', fontSize: '0.86rem', padding: '0.45rem 0.8rem', borderRadius: 999 },
+  userPill: { display: 'inline-flex', alignItems: 'center', gap: 6, maxWidth: 180 },
+  userInitial: { width: 24, height: 24, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderRadius: '50%', backgroundColor: '#e8efff', color: '#1f4fd8', fontSize: '0.78rem', fontWeight: 700, flexShrink: 0 },
+  who: { color: THEME.muted, fontSize: '0.84rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+  logout: { border: 'none', background: 'transparent', borderRadius: 6, padding: '0.3rem 0.35rem', cursor: 'pointer', color: THEME.faint, fontSize: '0.78rem' },
 
   loginWrap: { minHeight: '100vh', backgroundColor: THEME.desk, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1.5rem', fontFamily: THEME.sans },
   loginSheet: { width: '100%', maxWidth: 420, backgroundColor: THEME.paper, padding: '2.25rem 2rem', borderRadius: 4, boxShadow: '0 1px 0 #cfd3db, 0 8px 24px rgba(28,32,48,0.08)' },

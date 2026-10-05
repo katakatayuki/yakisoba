@@ -5,7 +5,8 @@ import { db, api } from './firebase';
 import {
   THEME, PEN, PEN_KEYS,
   buildPieces, selectionToRange, pointToIndex, snapToPunctuation,
-  nextSentenceEnd, prevSentenceEnd, computePatterns,
+  nextSentenceEnd, prevSentenceEnd,
+  SCORES,
   formatDate, clip,
 } from './lib';
 import ClaimCard from './ClaimCard';
@@ -54,8 +55,7 @@ export default function PostDetail({ postId, user, isFirst }) {
   const [cursor, setCursor] = useState(null); // ┃ カーソルの位置
   const [markStart, setMarkStart] = useState(null); // 「マーク開始」を押した位置
   const [pending, setPending] = useState(null); // 範囲が確定し、色を選ぶ待ち
-  const [showSeg, setShowSeg] = useState(false);
-  const [adoptColor, setAdoptColor] = useState('blue');
+  const [showBoundaries, setShowBoundaries] = useState(false);
   const [showFirst, setShowFirst] = useState(!!isFirst);
   const [notice, setNotice] = useState(null);
 
@@ -137,7 +137,22 @@ export default function PostDetail({ postId, user, isFirst }) {
     [markings, user.uid]
   );
 
-  const patterns = useMemo(() => computePatterns(visibleClaims, markings), [visibleClaims, markings]);
+  // 同じ位置を「境界」として選んだ人数を集計する。多数派の完成形を
+  // 選ばせるのではなく、本文上の濃淡としてだけ見せるためのデータ。
+  const boundaries = useMemo(() => {
+    const claimsById = new Map(visibleClaims.map((c) => [c.id, c]));
+    const usersAt = new Map();
+    markings.forEach((m) => {
+      const claim = claimsById.get(m.claimId);
+      if (!claim) return;
+      [claim.startIndex, claim.endIndex].forEach((index) => {
+        if (!usersAt.has(index)) usersAt.set(index, new Set());
+        usersAt.get(index).add(m.userId);
+      });
+    });
+    const counts = Object.fromEntries([...usersAt.entries()].map(([index, users]) => [index, users.size]));
+    return { counts, max: Math.max(0, ...Object.values(counts)) };
+  }, [visibleClaims, markings]);
 
   const highlight = useMemo(() => {
     if (markStart !== null && cursor !== null) {
@@ -286,17 +301,6 @@ export default function PostDetail({ postId, user, isFirst }) {
     }
   };
 
-  const adoptSegmentation = async (claimIds) => {
-    const result = await act(
-      () => api('/api/segmentations/adopt', {
-        method: 'POST',
-        body: { postId, claimIds, color: adoptColor },
-      }),
-      'この分け方を使いました。'
-    );
-    if (result) setShowSeg(false);
-  };
-
   // ----------------------------------------------------------------
   // レンダリング
   // ----------------------------------------------------------------
@@ -389,26 +393,14 @@ export default function PostDetail({ postId, user, isFirst }) {
             </button>
           </div>
 
-          {patterns.total > 0 && (
-            <div style={S.segHint}>
-              この文章には {patterns.total} 人が線を引いています。
-              <button type="button" style={S.linkButton} onClick={() => setShowSeg((v) => !v)}>
-                {showSeg ? 'みんなの分割を閉じる' : 'みんなの分割を見る'}
+          {boundaries.max > 0 && (
+            <div style={S.boundaryHint}>
+              <span>みんなの境界ガイド</span>
+              <span style={S.boundaryCopy}>濃い縦線ほど、その位置で区切った人が多い</span>
+              <button type="button" style={S.linkButton} onClick={() => setShowBoundaries((v) => !v)}>
+                {showBoundaries ? 'ガイドを隠す' : '表示する'}
               </button>
             </div>
-          )}
-
-          {showSeg && (
-            <SegmentationPanel
-              patterns={patterns}
-              claims={visibleClaims}
-              labels={labels}
-              myColors={myColors}
-              adoptColor={adoptColor}
-              onColor={setAdoptColor}
-              onAdopt={adoptSegmentation}
-              onClose={() => setShowSeg(false)}
-            />
           )}
 
           <BodyView
@@ -423,10 +415,13 @@ export default function PostDetail({ postId, user, isFirst }) {
             cursorRef={cursorElRef}
             onMouseUp={handleMouseUp}
             onSelectClaim={setSelectedId}
+            boundaries={showBoundaries ? boundaries : null}
+            annotations={annotations}
+            user={user}
+            act={act}
+            myReactions={myReactions}
           />
         </article>
-
-        {narrow && <div style={S.stackBlock}>{claimListEl}</div>}
 
         <section style={narrow ? S.stackBlock : S.right}>{panelEl}</section>
       </div>
@@ -454,7 +449,7 @@ export default function PostDetail({ postId, user, isFirst }) {
 
 function BodyView({
   text, claims, myColors, selectedId, highlight, cursor, markStart,
-  bodyRef, cursorRef, onMouseUp, onSelectClaim,
+  bodyRef, cursorRef, onMouseUp, onSelectClaim, boundaries, annotations, user, act, myReactions,
 }) {
   const claimsById = useMemo(() => new Map(claims.map((c) => [c.id, c])), [claims]);
   const pieces = useMemo(
@@ -473,6 +468,14 @@ function BodyView({
   };
 
   const cursorEl = <span ref={cursorRef} style={S.cursor} />;
+
+  const claimsEndingAt = new Map();
+  claims.forEach((claim) => {
+    if (!myColors[claim.id]) return;
+    const ending = claimsEndingAt.get(claim.endIndex) || [];
+    ending.push(claim);
+    claimsEndingAt.set(claim.endIndex, ending);
+  });
 
   return (
     <div ref={bodyRef} onMouseUp={onMouseUp} style={S.body}>
@@ -501,16 +504,98 @@ function BodyView({
         }
         if (covering.length > 0) style.cursor = 'pointer';
 
+        const boundaryCount = boundaries && boundaries.count[p.end];
+        const endingClaims = claimsEndingAt.get(p.end) || [];
+
         return (
           <React.Fragment key={p.start}>
             {markStart === p.start && <span style={S.startFlag} />}
             {cursor === p.start && cursorEl}
-            <span style={style} onClick={() => handlePick(covering)}>{p.text}</span>
+            <span data-text-start={p.start} style={style} onClick={() => handlePick(covering)}>{p.text}</span>
+            {boundaryCount > 0 && (
+              <span
+                aria-label={`ここで区切った人: ${boundaryCount}人`}
+                title={`ここで区切った人: ${boundaryCount}人`}
+                style={{ ...S.boundaryMark, opacity: 0.25 + (boundaryCount / boundaries.max) * 0.75 }}
+              />
+            )}
+            {endingClaims.map((claim) => (
+              <InlineThought
+                key={claim.id}
+                claim={claim}
+                color={myColors[claim.id]}
+                annotations={annotations}
+                user={user}
+                act={act}
+                reaction={myReactions[claim.id]}
+              />
+            ))}
           </React.Fragment>
         );
       })}
       {cursor === text.length && cursor !== null && cursorEl}
     </div>
+  );
+}
+
+// 本文の線の直下に、その線を引いた本人の言葉を置く。
+// 「どこに、どう反応したか」をスクロールの途中でも見失わないための小さな余白。
+function InlineThought({ claim, color, annotations, user, act, reaction }) {
+  const [editing, setEditing] = useState(false);
+  const [body, setBody] = useState('');
+  const [busy, setBusy] = useState(false);
+  const mine = annotations
+    .filter((a) => a.claimId === claim.id && a.authorId === user.uid && !a.parentId)
+    .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+  const current = reaction ? SCORES.find((score) => score.value === reaction.score) : null;
+
+  const submit = async (event) => {
+    event.preventDefault();
+    if (!body.trim()) return;
+    setBusy(true);
+    const result = await act(
+      () => api(`/api/claims/${claim.id}/annotations`, { method: 'POST', body: { type: 'opinion', body: body.trim() } }),
+      'あなたの考えを、線の下に残しました。'
+    );
+    setBusy(false);
+    if (result) {
+      setBody('');
+      setEditing(false);
+    }
+  };
+
+  return (
+    <aside style={{ ...S.inlineThought, borderLeftColor: PEN[color].ink }}>
+      <div style={S.inlineThoughtHead}>
+        <span style={{ ...S.inlineDot, backgroundColor: PEN[color].ink }} />
+        <b>あなたの余白</b>
+        {current && <span style={S.inlineReaction}>{current.short}</span>}
+      </div>
+      {mine.slice(0, 2).map((note) => <div key={note.id} style={S.inlineThoughtText}>{note.body}</div>)}
+      {mine.length === 0 && !editing && (
+        <button type="button" style={S.inlineWrite} onClick={() => setEditing(true)}>この線に、考えを書く</button>
+      )}
+      {mine.length > 0 && !editing && (
+        <button type="button" style={S.inlineWrite} onClick={() => setEditing(true)}>もう一つ書く</button>
+      )}
+      {editing && (
+        <form onSubmit={submit} style={S.inlineForm}>
+          <textarea
+            autoFocus
+            rows={2}
+            maxLength={2000}
+            value={body}
+            onChange={(event) => setBody(event.target.value)}
+            placeholder="この箇所を読んで考えたことを書く"
+            style={S.inlineTextarea}
+          />
+          <div style={S.inlineButtons}>
+            <button type="submit" disabled={busy || !body.trim()} style={S.inlineSubmit}>{busy ? '保存中…' : '余白に残す'}</button>
+            <button type="button" onClick={() => { setEditing(false); setBody(''); }} style={S.inlineCancel}>閉じる</button>
+          </div>
+        </form>
+      )}
+    </aside>
   );
 }
 
@@ -619,108 +704,36 @@ function ClaimList({ claims, labels, myColors, selectedId, onSelect }) {
 }
 
 // ====================================================================
-// みんなの分割
-// ====================================================================
-
-function SegmentationPanel({ patterns, claims, labels, myColors, adoptColor, onColor, onAdopt, onClose }) {
-  const claimsById = new Map(claims.map((c) => [c.id, c]));
-  const mineKey = Object.keys(myColors).filter((id) => claimsById.has(id))
-    .sort((a, b) => claimsById.get(a).startIndex - claimsById.get(b).startIndex
-      || claimsById.get(a).endIndex - claimsById.get(b).endIndex || a.localeCompare(b))
-    .join('|');
-
-  const top = patterns.list.slice(0, 3);
-  const restRatio = patterns.list.slice(3).reduce((a, g) => a + g.ratio, 0);
-
-  return (
-    <div style={S.seg}>
-      <div style={S.segHead}>
-        <strong>この文章をどう分けた人が多い？</strong>
-        <button type="button" style={S.linkButton} onClick={onClose}>閉じる</button>
-      </div>
-      <p style={S.segNote}>どの分け方が正しい、ということはありません。読み方の違いとして並べています。</p>
-
-      {top.map((g) => (
-        <div key={g.key} style={S.segRow}>
-          <div style={S.segRatio}>{Math.round(g.ratio * 100)}%</div>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={S.segChips}>
-              {g.claimIds.map((id) => (
-                <span key={id} style={S.segChip}>
-                  <b>{labels[id]}</b> {clip(claimsById.get(id).text, 18)}
-                </span>
-              ))}
-            </div>
-            {g.key === mineKey ? (
-              <span style={S.faint}>あなたの分け方です</span>
-            ) : (
-              <button type="button" style={S.adoptButton} onClick={() => onAdopt(g.claimIds)}>
-                この分け方を使う
-              </button>
-            )}
-          </div>
-        </div>
-      ))}
-
-      {restRatio > 0 && (
-        <div style={S.segRow}>
-          <div style={S.segRatio}>{Math.round(restRatio * 100)}%</div>
-          <div style={S.faint}>その他の分け方</div>
-        </div>
-      )}
-
-      <div style={S.segColors}>
-        <span style={S.faint}>採用するときの色:</span>
-        {PEN_KEYS.map((key) => (
-          <button
-            key={key}
-            type="button"
-            onClick={() => onColor(key)}
-            style={{
-              ...S.colorChip,
-              borderColor: PEN[key].ink,
-              backgroundColor: adoptColor === key ? PEN[key].tint : 'transparent',
-              color: PEN[key].ink,
-              fontWeight: adoptColor === key ? 700 : 400,
-            }}
-          >
-            {PEN[key].label}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ====================================================================
 // スタイル定義
 // ====================================================================
 
 const S = {
-  page: { maxWidth: 1360, margin: '0 auto', padding: '1.25rem 1rem' },
+  page: { maxWidth: 1280, margin: '0 auto', padding: '1.25rem 1rem' },
   state: { textAlign: 'center', padding: '4rem 1rem', fontSize: '1.1rem', color: THEME.muted },
-  layoutWide: { display: 'grid', gridTemplateColumns: '230px minmax(0, 1fr) 390px', gap: '1.25rem', alignItems: 'start' },
+  layoutWide: { display: 'grid', gridTemplateColumns: '190px minmax(0, 680px) 360px', gap: '1.25rem', justifyContent: 'center', alignItems: 'start' },
   layoutNarrow: { display: 'block' },
-  left: { position: 'sticky', top: 12, maxHeight: 'calc(100vh - 24px)', overflowY: 'auto' },
-  right: { position: 'sticky', top: 12, maxHeight: 'calc(100vh - 24px)', overflowY: 'auto', paddingRight: 4 },
+  left: { position: 'sticky', top: 78, maxHeight: 'calc(100vh - 92px)', overflowY: 'auto', padding: '0.5rem 0' },
+  right: { position: 'sticky', top: 78, maxHeight: 'calc(100vh - 92px)', overflowY: 'auto', paddingRight: 4 },
   stackBlock: { marginTop: '1.25rem' },
 
   paneTitle: { fontSize: '0.95rem', margin: '0 0 0.6rem', color: THEME.muted, fontWeight: 600 },
-  sheet: { backgroundColor: THEME.paper, padding: '2rem 2.25rem', borderRadius: 4, boxShadow: '0 1px 0 #cfd3db, 0 8px 24px rgba(28,32,48,0.06)', minWidth: 0 },
-  title: { fontFamily: THEME.serif, fontSize: '1.6rem', lineHeight: 1.4, margin: '0 0 0.4rem' },
-  meta: { color: THEME.faint, fontSize: '0.85rem', marginBottom: '1rem' },
-  body: { fontFamily: THEME.serif, fontSize: '1.08rem', lineHeight: 2.1, whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxWidth: '40em', WebkitTouchCallout: 'none' },
+  sheet: { backgroundColor: THEME.paper, padding: '1.5rem', borderRadius: 18, boxShadow: '0 1px 2px rgba(16,24,40,0.05), 0 10px 28px rgba(16,24,40,0.06)', border: `1px solid ${THEME.rule}`, minWidth: 0 },
+  title: { fontFamily: THEME.serif, fontSize: '1.65rem', lineHeight: 1.45, margin: '0 0 0.45rem', letterSpacing: '0.01em' },
+  meta: { color: THEME.faint, fontSize: '0.85rem', marginBottom: '1.15rem' },
+  body: { fontFamily: THEME.serif, fontSize: '1.08rem', lineHeight: 2.15, whiteSpace: 'pre-wrap', wordBreak: 'break-word', WebkitTouchCallout: 'none' },
 
   firstBanner: { backgroundColor: '#e8efff', color: '#1a3fa6', padding: '0.7rem 1rem', borderRadius: 6, marginBottom: '1rem', fontSize: '0.92rem', display: 'flex', justifyContent: 'space-between', gap: '1rem', alignItems: 'center' },
   bannerClose: { border: 'none', background: 'none', color: '#1a3fa6', cursor: 'pointer', fontSize: '0.85rem', flexShrink: 0 },
-  modeRow: { display: 'flex', gap: '0.75rem', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', padding: '0.6rem 0', margin: '0 0 1rem', borderTop: `1px solid ${THEME.rule}`, borderBottom: `1px solid ${THEME.rule}` },
+  modeRow: { display: 'flex', gap: '0.75rem', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', padding: '0.75rem 0', margin: '0 0 1rem', borderTop: `1px solid ${THEME.rule}`, borderBottom: `1px solid ${THEME.rule}` },
   hint: { color: THEME.muted, fontSize: '0.85rem', lineHeight: 1.6, flex: 1, minWidth: 220 },
   modeButton: { border: `1px solid ${THEME.rule}`, background: THEME.paper, borderRadius: 6, padding: '0.4rem 0.8rem', cursor: 'pointer', fontSize: '0.85rem' },
-  segHint: { fontSize: '0.88rem', color: THEME.muted, marginBottom: '1rem' },
+  boundaryHint: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: '0.82rem', color: THEME.muted, backgroundColor: '#f6f8fc', padding: '0.55rem 0.7rem', borderRadius: 10, marginBottom: '1rem' },
+  boundaryCopy: { color: THEME.faint },
   linkButton: { border: 'none', background: 'none', color: '#1f4fd8', cursor: 'pointer', fontSize: '0.88rem', padding: '0 0 0 0.5rem' },
 
   cursor: { display: 'inline-block', width: 0, height: '1.25em', borderLeft: `3px solid ${THEME.ink}`, verticalAlign: 'text-bottom', animation: 'nsCursor 1.1s ease-in-out infinite' },
   startFlag: { display: 'inline-block', width: 0, height: '1.25em', borderLeft: '3px solid #1f4fd8', verticalAlign: 'text-bottom' },
+  boundaryMark: { display: 'inline-block', width: 0, height: '1.65em', margin: '0 1px', borderLeft: `3px solid ${THEME.bridge}`, verticalAlign: 'text-bottom', borderRadius: 2, cursor: 'help' },
   readingLine: { position: 'fixed', left: 0, right: 0, top: '45vh', height: 0, borderTop: '1px dashed rgba(28,32,48,0.2)', pointerEvents: 'none', zIndex: 5 },
 
   notice: { position: 'fixed', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 100, padding: '0.7rem 1.2rem', borderRadius: 6, fontSize: '0.92rem', maxWidth: '90vw', boxShadow: '0 6px 20px rgba(0,0,0,0.15)' },
@@ -755,4 +768,16 @@ const S = {
 
   panelEmpty: { color: THEME.muted, fontSize: '0.92rem', lineHeight: 1.8, padding: '1rem 0.5rem' },
   faint: { color: THEME.faint, fontSize: '0.8rem', lineHeight: 1.6 },
+
+  inlineThought: { display: 'block', margin: '0.7rem 0 1rem', padding: '0.65rem 0.8rem', backgroundColor: '#f8faff', borderLeft: '3px solid', borderRadius: '0 10px 10px 0', fontFamily: THEME.sans, whiteSpace: 'normal', lineHeight: 1.6 },
+  inlineThoughtHead: { display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.8rem', color: THEME.muted },
+  inlineDot: { width: 8, height: 8, borderRadius: '50%', flexShrink: 0 },
+  inlineReaction: { marginLeft: 'auto', padding: '1px 7px', borderRadius: 999, backgroundColor: '#e9eef9', color: THEME.ink, fontSize: '0.72rem' },
+  inlineThoughtText: { fontSize: '0.92rem', color: THEME.ink, marginTop: 5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
+  inlineWrite: { border: 'none', padding: '4px 0', background: 'none', color: '#1f4fd8', cursor: 'pointer', fontSize: '0.82rem', fontFamily: 'inherit', marginTop: 2 },
+  inlineForm: { marginTop: 7 },
+  inlineTextarea: { display: 'block', boxSizing: 'border-box', width: '100%', padding: '0.55rem 0.65rem', border: `1px solid ${THEME.rule}`, borderRadius: 8, fontFamily: 'inherit', fontSize: '0.9rem', lineHeight: 1.55, resize: 'vertical' },
+  inlineButtons: { display: 'flex', gap: 6, marginTop: 6 },
+  inlineSubmit: { border: 'none', borderRadius: 999, padding: '0.35rem 0.8rem', backgroundColor: '#1f4fd8', color: '#fff', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 700, fontSize: '0.8rem' },
+  inlineCancel: { border: 'none', background: 'transparent', color: THEME.muted, cursor: 'pointer', fontFamily: 'inherit', fontSize: '0.8rem' },
 };
